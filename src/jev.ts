@@ -1,10 +1,10 @@
 import { config } from "./config.js";
-import { DEFAULT_CRITERIA, type Task, type WorldState } from "./types.js";
+import { DEFAULT_CRITERIA, type Plan, type WorldState } from "./types.js";
 
-/** Jev is the final action gate: it only picks among the planner's candidate ids. */
-export async function chooseAction(task: Task, state: WorldState): Promise<string> {
-  if (!config.jev.apiKey) return safeRule(task, state);
-  const criteria = usableCriteria(task.criteria, state);
+/** Jev gates the whole mission, not each micro-step. */
+export async function chooseMission(plan: Plan, state: WorldState): Promise<string> {
+  if (!config.jev.apiKey) return safeRule(plan, state);
+  const criteria = usableCriteria(plan.criteria, state);
   try {
     const response = await fetch(config.jev.endpoint, {
       method: "POST",
@@ -12,14 +12,14 @@ export async function chooseAction(task: Task, state: WorldState): Promise<strin
       body: JSON.stringify({
         model: config.jev.model,
         state: {
-          task: { skill: task.skill, reply: task.reply, intents: task.intents },
+          plan: { skill: plan.skill, reply: plan.reply, missions: plan.missions },
           world: state,
-          policy: "从候选里选最好玩又安全的陪玩动作。危险或低血量时优先 protect、stop 或 clarify。不要攻击玩家或村民。",
+          policy: "从候选任务里选一个完整陪玩任务。危险或低血量时优先 protect、stop 或 clarify。长任务可以一次批准多步。不要攻击玩家或村民。",
         },
         questions: {
           next_action: {
             type: "choice",
-            instructions: "根据孩子的话和当前世界，只选择一个候选动作。",
+            instructions: "根据孩子的话和当前世界，只选择一个候选任务。选中后机器人会自己把步骤做完。",
             criteria,
           },
         },
@@ -35,11 +35,11 @@ export async function chooseAction(task: Task, state: WorldState): Promise<strin
     return parsed.action;
   } catch (error) {
     console.error("Jev 决策失败，使用安全规则：", error);
-    return safeRule(task, state);
+    return safeRule(plan, state);
   }
 }
 
-function usableCriteria(criteria: Task["criteria"], state: WorldState): Record<string, string> {
+function usableCriteria(criteria: Plan["criteria"], state: WorldState): Record<string, string> {
   const picked: Record<string, string> = { ...criteria };
   if (state.health <= 6 && state.hostiles.some((hostile) => hostile.distance < 12)) {
     picked.protect ??= DEFAULT_CRITERIA.protect;
@@ -48,9 +48,9 @@ function usableCriteria(criteria: Task["criteria"], state: WorldState): Record<s
   return Object.keys(picked).length >= 2 ? picked : { ...DEFAULT_CRITERIA };
 }
 
-function safeRule(task: Task, state: WorldState): string {
+function safeRule(plan: Plan, state: WorldState): string {
   if (state.health <= 6 && state.hostiles.some((hostile) => hostile.distance < 12)) return "protect";
-  return task.skill;
+  return plan.skill;
 }
 
 function extractDecision(value: unknown, allowed: string[]): { action?: string; confidence: number } {
