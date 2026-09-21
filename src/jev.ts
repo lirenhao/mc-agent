@@ -3,6 +3,16 @@ import type { SkillName, Task, WorldState } from "./types.js";
 
 const allowed: SkillName[] = ["follow", "find_resource", "protect", "build", "stop", "status", "clarify"];
 
+const criteria: Record<SkillName, string> = {
+  follow: "孩子要机器人持续跟随。",
+  find_resource: "带孩子前往附近的木头、石头、煤或铁；发现后一起采。",
+  protect: "附近有怪物或孩子要求保护；苦力怕和低血量时撤离而不是硬刚。",
+  build: "在空地按模板放置背包里的材料，不覆盖已有方块。",
+  stop: "立即停止寻路和保护循环。",
+  status: "只报告生命、饥饿和附近威胁，不采取其他动作。",
+  clarify: "指令不清、材料不够或情况危险时澄清，不执行动作。",
+};
+
 /** Jev is the final action gate, never a source of executable game commands. */
 export async function chooseAction(task: Task, state: WorldState): Promise<SkillName> {
   if (!config.jev.apiKey) return safeRule(task, state);
@@ -11,14 +21,26 @@ export async function chooseAction(task: Task, state: WorldState): Promise<Skill
       method: "POST",
       headers: { Authorization: `Bearer ${config.jev.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        state: JSON.stringify({ task, state, policy: "只选择允许动作；危险、歧义或低血量时优先 stop、protect 或 clarify。" }),
+        model: config.jev.model,
+        state: {
+          task,
+          world: state,
+          policy: "只选择允许动作；危险、歧义或低血量时优先 stop、protect 或 clarify。",
+        },
         questions: {
-          next_action: { type: "choice", options: allowed },
+          next_action: {
+            type: "choice",
+            instructions: "根据孩子的任务和当前世界，只选择一个允许的下一步动作。",
+            criteria,
+          },
         },
       }),
       signal: AbortSignal.timeout(4_000),
     });
-    if (!response.ok) throw new Error(`Jev ${response.status}`);
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(`Jev ${response.status}: ${detail.slice(0, 500)}`);
+    }
     const parsed = extractDecision(await response.json());
     if (!parsed.action || parsed.confidence < config.jev.minConfidence) return "clarify";
     return parsed.action;
@@ -34,16 +56,14 @@ function safeRule(task: Task, state: WorldState): SkillName {
 }
 
 function extractDecision(value: unknown): { action?: SkillName; confidence: number } {
-  const strings: string[] = [];
-  const numbers: Array<{ key: string; value: number }> = [];
-  const walk = (node: unknown, key = ""): void => {
-    if (typeof node === "string") strings.push(node.toLowerCase());
-    else if (typeof node === "number" && Number.isFinite(node)) numbers.push({ key: key.toLowerCase(), value: node });
-    else if (Array.isArray(node)) node.forEach((item) => walk(item));
-    else if (node && typeof node === "object") Object.entries(node).forEach(([childKey, child]) => walk(child, childKey));
+  if (!value || typeof value !== "object") return { confidence: 0 };
+  const answers = (value as { answers?: Record<string, unknown> }).answers;
+  const next = answers?.next_action;
+  if (!next || typeof next !== "object") return { confidence: 0 };
+  const choice = (next as { choice?: unknown }).choice;
+  const confidence = Number((next as { confidence?: unknown }).confidence);
+  return {
+    action: typeof choice === "string" && allowed.includes(choice as SkillName) ? choice as SkillName : undefined,
+    confidence: Number.isFinite(confidence) ? confidence : 0,
   };
-  walk(value);
-  const action = allowed.find((item) => strings.some((text) => text === item || text.includes(`\"${item}\"`)));
-  const confidence = numbers.find((item) => /(confidence|probability|prob)/.test(item.key))?.value ?? 0;
-  return { action, confidence };
 }

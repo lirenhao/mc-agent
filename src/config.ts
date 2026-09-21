@@ -36,6 +36,7 @@ export const config = {
   jev: {
     apiKey: process.env.JEV_API_KEY,
     endpoint: process.env.JEV_ENDPOINT ?? "https://api.typesafe.ai/v1/systemone",
+    model: process.env.JEV_MODEL ?? "jev-1.13.0",
     minConfidence,
   },
   persona: {
