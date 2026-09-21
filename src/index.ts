@@ -1,4 +1,5 @@
 import mineflayer from "mineflayer";
+import { plugin as collectBlock } from "mineflayer-collectblock";
 import pathfinderModule from "mineflayer-pathfinder";
 import { config } from "./config.js";
 import { chooseAction } from "./jev.js";
@@ -17,6 +18,7 @@ const bot = mineflayer.createBot({
 });
 
 bot.loadPlugin(pathfinder);
+bot.loadPlugin(collectBlock);
 const skills = new SkillController(bot);
 let spawned = false;
 
@@ -26,7 +28,7 @@ async function handleInstruction(text: string, playerName: string): Promise<stri
   const state = getWorldState(bot);
   const task = await planTask(text, state);
   const action = await chooseAction(task, state);
-  const outcome = await skills.run(action, playerName, task.resource, task.template, state);
+  const outcome = await skills.run(action, playerName, task, state);
   const message = action === "clarify" ? task.reply : outcome;
   bot.chat(message);
   return message;

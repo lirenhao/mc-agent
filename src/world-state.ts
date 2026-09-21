@@ -19,5 +19,6 @@ export function getWorldState(bot: Bot): WorldState {
     time: bot.time.timeOfDay >= 13000 && bot.time.timeOfDay <= 23000 ? "night" : "day",
     nearbyPlayers: Object.values(bot.players).filter((player) => player.entity).map((player) => player.username),
     hostiles,
+    inventory: [...new Set(bot.inventory.items().map((item) => item.name))].slice(0, 16),
   };
 }

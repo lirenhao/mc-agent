@@ -1,21 +1,10 @@
 import { config } from "./config.js";
-import type { SkillName, Task, WorldState } from "./types.js";
+import { DEFAULT_CRITERIA, type Task, type WorldState } from "./types.js";
 
-const allowed: SkillName[] = ["follow", "find_resource", "protect", "build", "stop", "status", "clarify"];
-
-const criteria: Record<SkillName, string> = {
-  follow: "孩子要机器人持续跟随。",
-  find_resource: "带孩子前往附近的木头、石头、煤或铁；发现后一起采。",
-  protect: "附近有怪物或孩子要求保护；苦力怕和低血量时撤离而不是硬刚。",
-  build: "在空地按模板放置背包里的材料，不覆盖已有方块。",
-  stop: "立即停止寻路和保护循环。",
-  status: "只报告生命、饥饿和附近威胁，不采取其他动作。",
-  clarify: "指令不清、材料不够或情况危险时澄清，不执行动作。",
-};
-
-/** Jev is the final action gate, never a source of executable game commands. */
-export async function chooseAction(task: Task, state: WorldState): Promise<SkillName> {
+/** Jev is the final action gate: it only picks among the planner's candidate ids. */
+export async function chooseAction(task: Task, state: WorldState): Promise<string> {
   if (!config.jev.apiKey) return safeRule(task, state);
+  const criteria = usableCriteria(task.criteria, state);
   try {
     const response = await fetch(config.jev.endpoint, {
       method: "POST",
@@ -23,14 +12,14 @@ export async function chooseAction(task: Task, state: WorldState): Promise<Skill
       body: JSON.stringify({
         model: config.jev.model,
         state: {
-          task,
+          task: { skill: task.skill, reply: task.reply, intents: task.intents },
           world: state,
-          policy: "只选择允许动作；危险、歧义或低血量时优先 stop、protect 或 clarify。",
+          policy: "从候选里选最好玩又安全的陪玩动作。危险或低血量时优先 protect、stop 或 clarify。不要攻击玩家或村民。",
         },
         questions: {
           next_action: {
             type: "choice",
-            instructions: "根据孩子的任务和当前世界，只选择一个允许的下一步动作。",
+            instructions: "根据孩子的话和当前世界，只选择一个候选动作。",
             criteria,
           },
         },
@@ -41,7 +30,7 @@ export async function chooseAction(task: Task, state: WorldState): Promise<Skill
       const detail = await response.text();
       throw new Error(`Jev ${response.status}: ${detail.slice(0, 500)}`);
     }
-    const parsed = extractDecision(await response.json());
+    const parsed = extractDecision(await response.json(), Object.keys(criteria));
     if (!parsed.action || parsed.confidence < config.jev.minConfidence) return "clarify";
     return parsed.action;
   } catch (error) {
@@ -50,12 +39,21 @@ export async function chooseAction(task: Task, state: WorldState): Promise<Skill
   }
 }
 
-function safeRule(task: Task, state: WorldState): SkillName {
+function usableCriteria(criteria: Task["criteria"], state: WorldState): Record<string, string> {
+  const picked: Record<string, string> = { ...criteria };
+  if (state.health <= 6 && state.hostiles.some((hostile) => hostile.distance < 12)) {
+    picked.protect ??= DEFAULT_CRITERIA.protect;
+    picked.stop ??= DEFAULT_CRITERIA.stop;
+  }
+  return Object.keys(picked).length >= 2 ? picked : { ...DEFAULT_CRITERIA };
+}
+
+function safeRule(task: Task, state: WorldState): string {
   if (state.health <= 6 && state.hostiles.some((hostile) => hostile.distance < 12)) return "protect";
   return task.skill;
 }
 
-function extractDecision(value: unknown): { action?: SkillName; confidence: number } {
+function extractDecision(value: unknown, allowed: string[]): { action?: string; confidence: number } {
   if (!value || typeof value !== "object") return { confidence: 0 };
   const answers = (value as { answers?: Record<string, unknown> }).answers;
   const next = answers?.next_action;
@@ -63,7 +61,7 @@ function extractDecision(value: unknown): { action?: SkillName; confidence: numb
   const choice = (next as { choice?: unknown }).choice;
   const confidence = Number((next as { confidence?: unknown }).confidence);
   return {
-    action: typeof choice === "string" && allowed.includes(choice as SkillName) ? choice as SkillName : undefined,
+    action: typeof choice === "string" && allowed.includes(choice) ? choice : undefined,
     confidence: Number.isFinite(confidence) ? confidence : 0,
   };
 }
