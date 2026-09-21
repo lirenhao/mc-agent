@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MC 陪玩语音</title>
+  <style>body{max-width:42rem;margin:8vh auto;padding:1rem;color:#14213d;font:20px/1.5 system-ui,sans-serif}button{border:0;border-radius:1rem;background:#2563eb;color:#fff;cursor:pointer;font:inherit;padding:1rem 1.4rem}button:disabled{background:#94a3b8;cursor:not-allowed}#result{min-height:4rem;margin-top:1rem;padding:1rem;background:#eff6ff;border-radius:1rem;white-space:pre-line}</style>
+  <h1>MC 陪玩</h1>
+  <p>点一下按钮再说话，例如“跟着我”“带我找煤”“我们盖小木屋”。本页面不保存录音或文字。</p>
+  <button id="talk">🎙 开始说话</button><div id="result" aria-live="polite">准备好了。</div>
+  <script>
+    const Recognition=window.SpeechRecognition||window.webkitSpeechRecognition,button=document.querySelector('#talk'),result=document.querySelector('#result');
+    if(!Recognition){button.disabled=true;result.textContent='请使用支持网页语音识别的 Chrome 或 Edge。'}else button.onclick=()=>{const r=new Recognition();r.lang='zh-CN';r.interimResults=false;r.maxAlternatives=1;result.textContent='正在听…';button.disabled=true;r.start();r.onresult=async e=>{const text=e.results[0][0].transcript;result.textContent=`听到：${text}\n正在告诉陪玩伙伴…`;try{const response=await fetch('/transcript',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});result.textContent=`听到：${text}\n${(await response.json()).message}`}catch{result.textContent='发送失败，请确认机器人程序正在运行。'}button.disabled=false};r.onerror=()=>{result.textContent='没听清，请再试一次。';button.disabled=false};r.onend=()=>button.disabled=false};
+  </script>
+</html>

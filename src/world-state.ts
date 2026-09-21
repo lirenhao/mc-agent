@@ -6,8 +6,8 @@ const hostileNames = new Set(["zombie", "skeleton", "creeper", "spider", "enderm
 export function getWorldState(bot: Bot): WorldState {
   const position = bot.entity.position.floored();
   const hostiles = Object.values(bot.entities)
-    .filter((entity) => entity.type === "mob" && hostileNames.has(entity.name))
-    .map((entity) => ({ name: entity.name, distance: Number(entity.position.distanceTo(bot.entity.position).toFixed(1)) }))
+    .filter((entity) => entity.type === "mob" && Boolean(entity.name) && hostileNames.has(entity.name!))
+    .map((entity) => ({ name: entity.name!, distance: Number(entity.position.distanceTo(bot.entity.position).toFixed(1)) }))
     .filter((entity) => entity.distance < 20)
     .sort((a, b) => a.distance - b.distance)
     .slice(0, 6);

@@ -1,8 +1,10 @@
 import type { Bot } from "mineflayer";
-import { goals, Movements } from "mineflayer-pathfinder";
+import pathfinderModule from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { config } from "./config.js";
 import type { BuildTemplate, ResourceName, SkillName, WorldState } from "./types.js";
+
+const { goals, Movements } = pathfinderModule;
 
 const resourceBlocks: Record<ResourceName, string[]> = {
   wood: ["oak_log", "birch_log", "spruce_log", "jungle_log", "acacia_log", "dark_oak_log", "mangrove_log", "cherry_log"],
@@ -55,7 +57,12 @@ export class SkillController {
     this.stopProtection();
     const ids = resourceBlocks[resource].map((name) => this.bot.registry.blocksByName[name]?.id).filter((id): id is number => id !== undefined);
     const block = this.bot.findBlock({ matching: ids, maxDistance: 64 });
-    if (!block) return `附近还没有发现${resourceLabel(resource)}，我带你往前探索。`;
+    if (!block) {
+      const yaw = this.bot.entity.yaw;
+      const ahead = this.bot.entity.position.offset(-Math.sin(yaw) * 18, 0, -Math.cos(yaw) * 18).floored();
+      this.bot.pathfinder.setGoal(new goals.GoalNear(ahead.x, ahead.y, ahead.z, 2));
+      return `附近还没有发现${resourceLabel(resource)}，我先带你往前探索。`;
+    }
     this.bot.pathfinder.setGoal(new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2));
     return `我发现${resourceLabel(resource)}了，跟我来；找到后我们一起采。`;
   }
@@ -124,7 +131,7 @@ export class SkillController {
 
   private nearestHostile() {
     const hostileNames = new Set(["zombie", "skeleton", "spider", "witch", "drowned", "husk", "creeper"]);
-    return this.bot.nearestEntity((entity) => entity.type === "mob" && hostileNames.has(entity.name) && entity.position.distanceTo(this.bot.entity.position) < 14);
+    return this.bot.nearestEntity((entity) => entity.type === "mob" && Boolean(entity.name) && hostileNames.has(entity.name!) && entity.position.distanceTo(this.bot.entity.position) < 14);
   }
 
   private stopProtection(): void {
