@@ -3,12 +3,199 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MC 陪玩语音</title>
-  <style>body{max-width:42rem;margin:8vh auto;padding:1rem;color:#14213d;font:20px/1.5 system-ui,sans-serif}button{border:0;border-radius:1rem;background:#2563eb;color:#fff;cursor:pointer;font:inherit;padding:1rem 1.4rem}button:disabled{background:#94a3b8;cursor:not-allowed}#result{min-height:4rem;margin-top:1rem;padding:1rem;background:#eff6ff;border-radius:1rem;white-space:pre-line}</style>
+  <style>
+    body { max-width: 42rem; margin: 8vh auto; padding: 1rem; color: #14213d; font: 20px/1.5 system-ui, sans-serif; }
+    button { border: 0; border-radius: 1rem; background: #2563eb; color: #fff; cursor: pointer; font: inherit; padding: 1rem 1.4rem; }
+    button:disabled { background: #94a3b8; cursor: not-allowed; }
+    button.secondary { background: #e2e8f0; color: #14213d; }
+    label { display: flex; align-items: center; gap: 0.4rem; font-size: 1rem; color: #334155; }
+    .row { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+    .compose { display: flex; gap: 0.75rem; margin-top: 1rem; }
+    .compose input { flex: 1; min-width: 0; border: 1px solid #cbd5e1; border-radius: 1rem; font: inherit; padding: 1rem 1.2rem; }
+    #result { min-height: 4rem; margin-top: 1rem; padding: 1rem; background: #eff6ff; border-radius: 1rem; }
+    #heard { color: #334155; }
+    #reply { margin-top: 0.5rem; }
+    #reply .spoken { background: #bfdbfe; border-radius: 0.2em; }
+    #reply .rest { color: #1e3a8a; }
+    #status { margin-top: 0.35rem; font-size: 1rem; color: #64748b; }
+  </style>
   <h1>MC 陪玩</h1>
-  <p>点一下按钮再说话，例如“跟着我”“带我找煤”“我们盖小木屋”。本页面不保存录音或文字。</p>
-  <button id="talk">🎙 开始说话</button><div id="result" aria-live="polite">准备好了。</div>
+  <p>点一下按钮再说话，或在下面打字。回复会显示在页面上，并同步朗读。本页面不保存录音或文字。</p>
+  <div class="row">
+    <button id="talk" type="button">🎙 开始说话</button>
+    <button id="stopSpeak" class="secondary" type="button" hidden>停止朗读</button>
+    <label><input id="speakToggle" type="checkbox" checked> 朗读回复</label>
+  </div>
+  <form class="compose" id="compose">
+    <input id="typed" type="text" maxlength="160" autocomplete="off" placeholder="也可以打字，例如：跟着我">
+    <button type="submit">发送</button>
+  </form>
+  <div id="result" aria-live="polite">
+    <div id="heard">准备好了。</div>
+    <div id="reply"></div>
+    <div id="status"></div>
+  </div>
   <script>
-    const Recognition=window.SpeechRecognition||window.webkitSpeechRecognition,button=document.querySelector('#talk'),result=document.querySelector('#result');
-    if(!Recognition){button.disabled=true;result.textContent='请使用支持网页语音识别的 Chrome 或 Edge。'}else button.onclick=()=>{const r=new Recognition();r.lang='zh-CN';r.interimResults=false;r.maxAlternatives=1;result.textContent='正在听…';button.disabled=true;r.start();r.onresult=async e=>{const text=e.results[0][0].transcript;result.textContent=`听到：${text}\n正在告诉陪玩伙伴…`;try{const response=await fetch('/transcript',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});result.textContent=`听到：${text}\n${(await response.json()).message}`}catch{result.textContent='发送失败，请确认机器人程序正在运行。'}button.disabled=false};r.onerror=()=>{result.textContent='没听清，请再试一次。';button.disabled=false};r.onend=()=>button.disabled=false};
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const canSpeak = "speechSynthesis" in window;
+    const talk = document.querySelector("#talk");
+    const stopSpeak = document.querySelector("#stopSpeak");
+    const speakToggle = document.querySelector("#speakToggle");
+    const compose = document.querySelector("#compose");
+    const typed = document.querySelector("#typed");
+    const heard = document.querySelector("#heard");
+    const reply = document.querySelector("#reply");
+    const status = document.querySelector("#status");
+    let currentUtterance = null;
+
+    function chineseVoice() {
+      const voices = speechSynthesis.getVoices();
+      return voices.find((voice) => voice.lang.toLowerCase().startsWith("zh")) ?? null;
+    }
+
+    function stopSpeaking() {
+      if (!canSpeak) return;
+      currentUtterance = null;
+      speechSynthesis.cancel();
+      stopSpeak.hidden = true;
+      status.textContent = "";
+    }
+
+    function showReply(text, spokenUntil = 0) {
+      reply.replaceChildren();
+      if (!text) return;
+      if (spokenUntil <= 0) {
+        const rest = document.createElement("span");
+        rest.className = "rest";
+        rest.textContent = text;
+        reply.append(rest);
+        return;
+      }
+      if (spokenUntil >= text.length) {
+        reply.textContent = text;
+        return;
+      }
+      const spoken = document.createElement("span");
+      spoken.className = "spoken";
+      spoken.textContent = text.slice(0, spokenUntil);
+      const rest = document.createElement("span");
+      rest.className = "rest";
+      rest.textContent = text.slice(spokenUntil);
+      reply.append(spoken, rest);
+    }
+
+    function speak(text) {
+      if (!canSpeak || !speakToggle.checked || !text) {
+        showReply(text, text.length);
+        return;
+      }
+      stopSpeaking();
+      showReply(text, 0);
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "zh-CN";
+      utterance.rate = 0.92;
+      const voice = chineseVoice();
+      if (voice) utterance.voice = voice;
+      utterance.onboundary = (event) => {
+        if (utterance !== currentUtterance) return;
+        const length = event.charLength > 0 ? event.charLength : 1;
+        showReply(text, Math.min(text.length, event.charIndex + length));
+      };
+      utterance.onstart = () => {
+        stopSpeak.hidden = false;
+        status.textContent = "正在朗读…";
+      };
+      utterance.onend = () => {
+        if (utterance !== currentUtterance) return;
+        currentUtterance = null;
+        showReply(text, text.length);
+        stopSpeak.hidden = true;
+        status.textContent = "";
+      };
+      utterance.onerror = () => {
+        if (utterance !== currentUtterance) return;
+        currentUtterance = null;
+        showReply(text, text.length);
+        stopSpeak.hidden = true;
+        status.textContent = "";
+      };
+      currentUtterance = utterance;
+      speechSynthesis.speak(utterance);
+    }
+
+    async function submit(text) {
+      const trimmed = text.trim().slice(0, 160);
+      if (!trimmed) {
+        heard.textContent = "没有听到内容，请再试一次。";
+        showReply("");
+        return;
+      }
+      stopSpeaking();
+      heard.textContent = `听到：${trimmed}`;
+      reply.textContent = "正在告诉陪玩伙伴…";
+      status.textContent = "";
+      try {
+        const response = await fetch("/transcript", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: trimmed }),
+        });
+        const payload = await response.json();
+        const message = String(payload.message ?? "我现在没准备好，请稍后再试。");
+        speak(message);
+      } catch {
+        heard.textContent = "发送失败，请确认机器人程序正在运行。";
+        showReply("");
+      }
+    }
+
+    if (canSpeak) {
+      speechSynthesis.getVoices();
+      speechSynthesis.addEventListener("voiceschanged", chineseVoice);
+    } else {
+      speakToggle.checked = false;
+      speakToggle.disabled = true;
+      speakToggle.parentElement.append("（当前浏览器不支持朗读）");
+    }
+
+    stopSpeak.onclick = () => {
+      const text = reply.textContent;
+      stopSpeaking();
+      showReply(text, text.length);
+    };
+
+    compose.onsubmit = (event) => {
+      event.preventDefault();
+      const text = typed.value;
+      typed.value = "";
+      void submit(text);
+    };
+
+    if (!Recognition) {
+      talk.disabled = true;
+      heard.textContent = "请使用支持网页语音识别的 Chrome 或 Edge。仍可以打字发送。";
+    } else {
+      talk.onclick = () => {
+        stopSpeaking();
+        const recognition = new Recognition();
+        recognition.lang = "zh-CN";
+        recognition.interimResults = false;
+        recognition.maxAlternatives = 1;
+        heard.textContent = "正在听…";
+        showReply("");
+        status.textContent = "";
+        talk.disabled = true;
+        recognition.start();
+        recognition.onresult = (event) => {
+          void submit(event.results[0][0].transcript);
+        };
+        recognition.onerror = () => {
+          heard.textContent = "没听清，请再试一次。";
+        };
+        recognition.onend = () => {
+          talk.disabled = false;
+        };
+      };
+    }
   </script>
 </html>
