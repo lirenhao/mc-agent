@@ -50,9 +50,18 @@ export class Skills {
   keepFollow(playerName: string, distance = 3): boolean {
     const player = this.bot.players[playerName];
     if (!player?.entity) return false;
+    this.bot.setControlState("sneak", false);
     this.bot.pathfinder.setMovements(new Movements(this.bot));
     this.bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, distance), true);
     return true;
+  }
+
+  keepSit(playerName: string): void {
+    this.bot.pathfinder.setGoal(null);
+    this.bot.clearControlStates();
+    this.bot.setControlState("sneak", true);
+    const player = this.bot.players[playerName];
+    if (player?.entity) void this.bot.lookAt(player.entity.position.offset(0, 1.2, 0));
   }
 
   protectOnce(playerName: string): boolean {
@@ -118,6 +127,7 @@ export class Skills {
     if (type === "dance" || type === "jump" || type === "emote") return this.dance();
     if (type === "eat") return this.eat();
     if (type === "look") return this.look(playerName);
+    if (type === "sit" || type === "sneak" || type === "rest") return this.sit(playerName);
     if (intent.block || intent.item) return this.collectOne({ ...intent, type: "collect" });
     if (intent.entity) return this.attack(intent);
     return this.explore();
@@ -188,26 +198,38 @@ export class Skills {
     }
   }
 
-  private attack(intent: ActionIntent): StepResult {
+  private async attack(intent: ActionIntent): Promise<StepResult> {
+    await this.equipWeapon();
     const targetName = intent.entity?.toLowerCase();
     const entity = this.bot.nearestEntity((candidate) => {
       if (!candidate.name) return false;
       if (candidate.type === "player" || neverAttack.has(candidate.name)) return false;
-      if (candidate.position.distanceTo(this.bot.entity.position) > 16) return false;
+      if (candidate.position.distanceTo(this.bot.entity.position) > 24) return false;
       if (targetName) return candidate.name === targetName || candidate.name.includes(targetName);
       return candidate.type === "mob" && this.isHostile(candidate.name);
     });
-    if (!entity) return { status: "done", message: intent.entity ? `附近没有${intent.label ?? intent.entity}了。` : "附近暂时没有要对付的东西。" };
+    if (!entity) return { status: "done", message: intent.entity ? `附近没有${intent.label ?? intent.entity}了。` : "附近暂时没有要打的。" };
     if (entity.name === "creeper") {
       this.bot.pathfinder.setGoal(new goals.GoalNear(this.bot.entity.position.x - 8, this.bot.entity.position.y, this.bot.entity.position.z - 8, 2));
       return { status: "progress", message: "那是苦力怕，我们先撤开。" };
     }
+    void this.bot.lookAt(entity.position.offset(0, (entity.height ?? 1.6) * 0.7, 0));
     if (entity.position.distanceTo(this.bot.entity.position) < 3.2) {
       this.bot.attack(entity);
       return { status: "progress" };
     }
+    this.bot.pathfinder.setMovements(new Movements(this.bot));
     this.bot.pathfinder.setGoal(new goals.GoalNear(entity.position.x, entity.position.y, entity.position.z, 2));
     return { status: "progress" };
+  }
+
+  private async equipWeapon(): Promise<void> {
+    const held = this.bot.heldItem?.name ?? "";
+    if (/_sword$|_axe$/.test(held)) return;
+    const weapon = this.bot.inventory.items().find((item) => /_sword$|_axe$/.test(item.name));
+    if (weapon) {
+      try { await this.bot.equip(weapon, "hand"); } catch { /* keep going unarmed */ }
+    }
   }
 
   private async buildOne(intent: ActionIntent): Promise<StepResult> {
@@ -293,6 +315,27 @@ export class Skills {
     }
   }
 
+  private sit(playerName: string): StepResult {
+    const player = this.bot.players[playerName];
+    if (player?.entity && player.entity.position.distanceTo(this.bot.entity.position) > 3.5) return this.come(playerName);
+    const stair = this.nearbySeat();
+    if (stair && stair.position.distanceTo(this.bot.entity.position) > 1.6) {
+      this.bot.setControlState("sneak", false);
+      this.bot.pathfinder.setMovements(new Movements(this.bot));
+      this.bot.pathfinder.setGoal(new goals.GoalNear(stair.position.x, stair.position.y, stair.position.z, 1));
+      return { status: "progress", message: "我去那边坐一下。" };
+    }
+    this.keepSit(playerName);
+    return { status: "done", message: "我坐下了。" };
+  }
+
+  private nearbySeat() {
+    return this.bot.findBlock({
+      matching: (block) => /stairs|chair|bench/.test(block.name) && !block.name.includes("wall"),
+      maxDistance: 8,
+    });
+  }
+
   private async look(playerName: string): Promise<StepResult> {
     const player = this.bot.players[playerName];
     if (!player?.entity) return { status: "blocked", message: "我现在看不到你。" };
@@ -325,7 +368,7 @@ export class Skills {
   }
 
   private isHostile(name: string): boolean {
-    return ["zombie", "skeleton", "spider", "witch", "drowned", "husk", "creeper"].includes(name);
+    return ["zombie", "skeleton", "spider", "witch", "drowned", "husk", "creeper", "slime", "enderman"].includes(name);
   }
 
   private nearestHostile() {

@@ -205,6 +205,29 @@ export class Companion {
       this.skills.protectOnce(playerName);
       return;
     }
+    if (mission.mode === "hunt") {
+      const intent = mission.steps.find((step) => /attack|hunt/i.test(step.type)) ?? { type: "attack" };
+      const result = await this.skills.progress(intent, playerName, state);
+      if (result.message) this.say(result.message);
+      if (result.status === "done") this.skills.keepFollow(playerName, 4);
+      return;
+    }
+    if (mission.mode === "sit") {
+      if (state.childVisible && state.childDistance !== undefined && state.childDistance > 8) {
+        this.skills.keepFollow(playerName, 3);
+        return;
+      }
+      const step = mission.steps[mission.stepIndex];
+      if (step && step.type.toLowerCase() !== "sit") {
+        const result = await this.skills.progress(step, playerName, state);
+        if (result.status === "done" || result.status === "blocked") this.nextStep(playerName, state);
+        return;
+      }
+      const result = await this.skills.progress({ type: "sit" }, playerName, state);
+      if (result.message) this.say(result.message);
+      if (result.status !== "progress") this.skills.keepSit(playerName);
+      return;
+    }
     const step = mission.steps[mission.stepIndex];
     if (!step) {
       this.finish(playerName, "做完了，我回来找你。");
@@ -295,6 +318,8 @@ export class Companion {
 function fallbackBlueprint(id: string, plan: Plan): MissionBlueprint {
   if (id === "protect") return { mode: "guard", title: "保护", steps: [{ type: "protect" }] };
   if (id === "follow") return { mode: "follow", title: "跟随", steps: [{ type: "follow" }] };
+  if (id === "sit") return { mode: "sit", title: "坐下", steps: [{ type: "come" }, { type: "sit" }] };
+  if (id === "attack" || id === "hunt") return { mode: "hunt", title: "进攻", steps: [{ type: "attack", entity: plan.entity, label: plan.entity }] };
   if (id === "stop") return { mode: "stop", title: "停下", steps: [{ type: "stop" }] };
   return plan.missions[plan.skill] ?? { mode: "idle", steps: [{ type: "follow" }] };
 }

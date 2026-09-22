@@ -1,7 +1,7 @@
 export type SkillName = "follow" | "find_resource" | "protect" | "build" | "stop" | "status" | "clarify";
 export type ResourceName = "wood" | "stone" | "coal" | "iron";
 export type BuildTemplate = "cabin" | "farm" | "camp";
-export type MissionMode = "focused" | "follow" | "guard" | "idle" | "stop";
+export type MissionMode = "focused" | "follow" | "guard" | "idle" | "stop" | "sit" | "hunt";
 
 export const SKILL_NAMES: SkillName[] = ["follow", "find_resource", "protect", "build", "stop", "status", "clarify"];
 
@@ -38,6 +38,7 @@ export type Plan = {
   skill: string;
   resource?: ResourceName;
   template?: BuildTemplate;
+  entity?: string;
   reply: string;
   criteria: Record<string, string>;
   missions: Record<string, MissionBlueprint>;
