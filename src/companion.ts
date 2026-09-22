@@ -1,6 +1,7 @@
 import type { Bot } from "mineflayer";
 import { config } from "./config.js";
 import { chooseMission } from "./jev.js";
+import { Partner, type Assist } from "./partner.js";
 import { Skills } from "./skills.js";
 import { planMission } from "./task-planner.js";
 import type { Mission, MissionBlueprint, Plan, WorldState } from "./types.js";
@@ -11,6 +12,8 @@ const MISSION_LIMIT_MS = 5 * 60_000;
 const CHAT_GAP_MS = 8_000;
 const CATCH_UP_BLOCKS = 26;
 const STUCK_TICKS = 10;
+const ERRAND_GAP_MS = 45_000;
+const TORCH_GAP_MS = 90_000;
 
 type Pending = { text: string; playerName: string; resolve: (message: string) => void };
 
@@ -26,7 +29,10 @@ export class Companion {
   private lastNightNotice?: "day" | "night";
   private stuck = 0;
   private lastPos = { x: 0, y: 0, z: 0 };
+  private lastErrand = 0;
+  private lastTorch = 0;
   private timer?: NodeJS.Timeout;
+  private readonly partner = new Partner();
 
   constructor(
     private readonly bot: Bot,
@@ -34,6 +40,7 @@ export class Companion {
   ) {}
 
   start(): void {
+    this.partner.bind(this.bot, this.childName());
     this.timer = setInterval(() => void this.tick(), TICK_MS);
   }
 
@@ -127,12 +134,12 @@ export class Companion {
     if (!playerName) return;
     const state = this.snapshot();
 
-    if (this.handleEmergency(state, playerName)) return;
+    if (await this.handleEmergency(state, playerName)) return;
     if (this.busy) return;
     if (await this.maybeEat()) return;
     this.noticeNight(state);
 
-    if (this.mission) {
+    if (this.mission && this.mission.mode !== "follow") {
       if (Date.now() - this.mission.startedAt > MISSION_LIMIT_MS) {
         this.say("这件事变久了，我先回到你身边。", true);
         this.mission = undefined;
@@ -154,21 +161,70 @@ export class Companion {
     }
 
     if (this.stayPut) return;
-    this.skills.keepFollow(playerName, state.time === "night" ? 2 : 4);
+    const assist = this.partner.decide(this.bot, playerName, {
+      canErrand: Date.now() - this.lastErrand > ERRAND_GAP_MS && state.time === "day" && state.hostiles.length === 0 && (state.childDistance ?? 99) < 12,
+      canLight: state.time === "night" && Date.now() - this.lastTorch > TORCH_GAP_MS,
+    });
+    await this.cooperate(assist, playerName, state);
   }
 
-  private handleEmergency(state: WorldState, playerName: string): boolean {
-    const closeHostile = state.hostiles.some((hostile) => hostile.distance < 10)
+  private async cooperate(assist: Assist, playerName: string, state: WorldState): Promise<void> {
+    if (assist.kind === "follow" || assist.kind === "fight") {
+      this.skills.keepFollow(playerName, state.time === "night" ? 2 : 4);
+      return;
+    }
+    if (assist.kind === "light") {
+      this.lastTorch = Date.now();
+      this.busy = true;
+      try {
+        const result = await this.skills.lightNear(playerName);
+        if (result.message) this.say(result.message);
+      } finally {
+        this.busy = false;
+      }
+      return;
+    }
+    if (assist.kind === "errand") this.lastErrand = Date.now();
+    this.say(assist.kind === "mine" ? `我来帮你挖${assist.label}。` : `我去旁边拿点${assist.label}，马上回来。`);
+    this.busy = true;
+    try {
+      await this.skills.helpGather(
+        assist.block,
+        playerName,
+        assist.kind === "mine" ? 10 : 14,
+        assist.kind === "mine" ? assist.avoid : undefined,
+      );
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  private async handleEmergency(state: WorldState, playerName: string): Promise<boolean> {
+    const child = this.bot.players[playerName]?.entity;
+    const threatNearChild = child ? this.skills.threatNear(child.position, 8) : undefined;
+    const closeHostile = Boolean(threatNearChild)
+      || state.hostiles.some((hostile) => hostile.distance < 10)
       || (this.skills.nearestHostileDistance() ?? 99) < 10;
-    const childInDanger = Boolean(state.childVisible && state.childDistance !== undefined && state.childDistance < 16 && closeHostile);
+    const childInDanger = Boolean(threatNearChild || (state.childVisible && state.childDistance !== undefined && state.childDistance < 16 && closeHostile));
     const selfInDanger = state.health <= 6 && closeHostile;
     if (childInDanger || selfInDanger) {
       if (!this.emergency) {
         this.skills.stop();
         this.emergency = true;
-        this.say("小心，我来挡住。", true);
+        const helping = Boolean(threatNearChild && threatNearChild.name !== "creeper");
+        this.say(helping ? "我过来帮你打。" : "小心，我来挡住。", true);
       }
-      this.skills.protectOnce(playerName);
+      if (this.busy) return true;
+      if (threatNearChild && threatNearChild.name !== "creeper") {
+        this.busy = true;
+        try {
+          await this.skills.progress({ type: "attack", entity: threatNearChild.name, label: threatNearChild.name }, playerName, state);
+        } finally {
+          this.busy = false;
+        }
+      } else {
+        this.skills.protectOnce(playerName);
+      }
       return true;
     }
     if (this.emergency) {

@@ -15,109 +15,177 @@ export async function planMission(transcript: string, state: WorldState): Promis
       headers: { Authorization: `Bearer ${config.llm.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: config.llm.model,
-        temperature: 0.4,
+        temperature: 0.1,
         response_format: { type: "json_object" },
         messages: [
           {
             role: "system",
-            content: `你是 Minecraft 陪玩 ${config.persona.name}。风格：${config.persona.style}。把孩子的话变成 JSON：{skill,reply,criteria,missions}。
-skill 是推荐任务 id（英文蛇形）。
-criteria 给实时闸门：键是任务 id，值是一句话。至少 2 个，最多 6 个，必须含推荐 skill 和 clarify。
-missions 为每个 criteria 键提供 {mode,title,steps}。
-mode：focused=专心做完再回孩子身边；follow=一直跟着；guard=边陪边防怪；hunt=主动进攻直到停下；idle=只待在附近；stop=停下；sit=走到身边坐下陪着。
-steps 是有序长任务，每步 {type,block?,entity?,item?,count?,template?,x?,y?,z?,label?}。
-复杂要求必须拆步，例如“砍树盖房子”→ collect 木头 → come → build cabin。采集 count 最多 24。
-type 常用：follow, stop, status, protect, attack, hunt, find, collect, build, place, give, explore, come, look, dance, eat, goto, wait, sit, clarify。
-block/item/entity 用 Minecraft 英文 id。label 用中文短名。reply 不超过 35 个汉字。
-孩子说攻击、去打、打怪时 skill=attack、mode=hunt；entity 填 zombie、skeleton、spider 等，没说种类就打附近敌对生物，一直打到停下。苦力怕只撤离。不要攻击玩家或村民。不能确定时 skill=clarify。若已有 mission，优先把孩子的新话理解成改任务或追加，而不是忽略。`,
+            content: `你是 Minecraft 陪玩 ${config.persona.name}。风格：${config.persona.style}。只输出一个 JSON 对象，不要 markdown。
+格式：{"reply":"不超过35字","mode":"focused|follow|guard|hunt|sit|stop|idle","title":"短标题","steps":[{"type":"collect","block":"oak_log","count":8,"label":"木头"}]}
+type 只能是：follow, stop, protect, collect, attack, build, place, give, come, look, dance, eat, goto, sit, wait。
+mode：follow=一直跟着；guard=保护；hunt=一直进攻直到停下；sit=坐下陪着；stop=停下；focused=按 steps 做完再回来。
+多件事拆成有序 steps。例如砍树盖房：collect oak_log → come → build，template 只能是 cabin、farm、camp。
+block/item 用英文 id（木头用 oak_log，石头用 stone，煤用 coal_ore，铁用 iron_ore，花用 dandelion）。
+攻击时 type=attack，mode=hunt，entity 用 zombie、skeleton、spider、creeper 等；没点名就省略 entity。不要攻击玩家或村民。
+听不懂时 steps 用 [{"type":"wait"}]，reply 请孩子再说具体一点。`,
           },
-          { role: "user", content: JSON.stringify({ transcript, state }) },
+          {
+            role: "user",
+            content: JSON.stringify({
+              said: transcript,
+              health: state.health,
+              food: state.food,
+              time: state.time,
+              hostiles: state.hostiles.slice(0, 3),
+              inventory: state.inventory.slice(0, 8),
+              childNearby: state.childVisible,
+              doing: state.mission?.title,
+            }),
+          },
         ],
       }),
       signal: AbortSignal.timeout(12_000),
     });
     if (!result.ok) throw new Error(`LLM ${result.status}`);
-    const content = (await result.json() as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content;
-    return validatePlan(JSON.parse(content ?? "{}"));
+    const content = (await result.json() as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content ?? "";
+    return interpretModel(parseModelJson(content), transcript);
   } catch (error) {
-    if (isTimeout(error)) {
-      console.error("大模型规划超时，使用默认任务：", error);
-      return withDefaultMissions(localPlan(transcript));
-    }
-    console.error("大模型规划失败：", error);
-    return localClarify();
+    console.error(isTimeout(error) ? "大模型规划超时，改用口令：" : "大模型规划失败，改用口令：", error);
+    return withDefaultMissions(localPlan(transcript));
   }
 }
 
-function validatePlan(value: unknown): Plan {
-  if (!value || typeof value !== "object") return localClarify();
-  const candidate = value as { skill?: unknown; reply?: unknown; criteria?: unknown; missions?: unknown; resource?: unknown; template?: unknown; entity?: unknown };
-  const skill = sanitizeActionId(String(candidate.skill ?? ""));
-  if (!skill) return localClarify();
-  const criteria = sanitizeCriteria(candidate.criteria, skill);
-  if (!criteria) return localClarify();
-  const missions = sanitizeMissions(candidate.missions, criteria, candidate.resource, candidate.template, candidate.entity);
-  const entity = typeof candidate.entity === "string" ? candidate.entity.trim().slice(0, 40).toLowerCase() : undefined;
-  return {
-    skill,
-    resource: resources.includes(candidate.resource as ResourceName) ? candidate.resource as ResourceName : undefined,
-    template: templates.includes(candidate.template as BuildTemplate) ? candidate.template as BuildTemplate : undefined,
-    entity: entity || undefined,
-    reply: typeof candidate.reply === "string" && candidate.reply.length <= 70 ? candidate.reply : "好，我来陪你一起做。",
-    criteria,
-    missions,
-  };
-}
-
-function sanitizeCriteria(value: unknown, recommended: string): Record<string, string> | undefined {
-  const criteria: Record<string, string> = {};
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    for (const [key, description] of Object.entries(value as Record<string, unknown>)) {
-      const id = sanitizeActionId(key);
-      if (!id || typeof description !== "string") continue;
-      const text = description.trim().slice(0, 80);
-      if (text) criteria[id] = text;
-      if (Object.keys(criteria).length >= 6) break;
-    }
+function parseModelJson(content: string): unknown {
+  const fenced = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const raw = (fenced?.[1] ?? content).trim();
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start >= 0 && end > start) return JSON.parse(raw.slice(start, end + 1));
+    throw new Error("模型没有返回 JSON");
   }
-  if (!criteria[recommended]) criteria[recommended] = "按孩子刚才说的去做。";
-  if (!criteria.clarify) criteria.clarify = DEFAULT_CRITERIA.clarify;
-  return Object.keys(criteria).length >= 2 ? criteria : undefined;
 }
 
-function sanitizeMissions(value: unknown, criteria: Record<string, string>, resource: unknown, template: unknown, entity: unknown): Record<string, MissionBlueprint> {
-  const source = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-  const missions: Record<string, MissionBlueprint> = {};
-  for (const id of Object.keys(criteria)) {
-    missions[id] = sanitizeBlueprint(source[id], id, resource, template, entity);
+function interpretModel(value: unknown, transcript: string): Plan {
+  const root = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  const steps = root ? readSteps(root) : [];
+  if (!root || !steps.length) {
+    console.warn("模型输出里没有可执行步骤，改用口令。");
+    return withDefaultMissions(localPlan(transcript));
   }
-  return missions;
-}
-
-function sanitizeBlueprint(value: unknown, id: string, resource: unknown, template: unknown, entity: unknown): MissionBlueprint {
-  const raw = value && typeof value === "object" ? value as Record<string, unknown> : {};
-  const mode = modes.includes(raw.mode as MissionMode) ? raw.mode as MissionMode : inferMode(id);
-  const steps = Array.isArray(raw.steps) ? raw.steps.map(sanitizeIntent).filter((step): step is ActionIntent => Boolean(step)).slice(0, 12) : [];
-  if (!steps.length) steps.push(fallbackStep(id, resource, template, entity));
-  return {
-    mode,
-    title: typeof raw.title === "string" ? raw.title.trim().slice(0, 24) : undefined,
+  const reply = clip(root.reply ?? root.message, 70) || "好，我来陪你一起做。";
+  if (steps.length === 1 && steps[0].type === "wait") {
+    return {
+      skill: "clarify",
+      reply,
+      criteria: { clarify: reply, stop: "停下，不执行新任务。" },
+      missions: {
+        clarify: { mode: "idle", title: "再问一次", steps: [{ type: "wait" }] },
+        stop: { mode: "stop", title: "停下", steps: [{ type: "stop" }] },
+      },
+    };
+  }
+  const blueprint: MissionBlueprint = {
+    mode: readMode(root.mode, steps),
+    title: clip(root.title, 24),
     steps,
   };
+  return {
+    skill: "do",
+    entity: steps.find((step) => step.entity)?.entity,
+    reply,
+    criteria: {
+      do: blueprint.title || reply,
+      protect: "孩子附近有危险，先保护而不是继续原任务。",
+      stop: "任务会伤害玩家或村民，或者不该执行。",
+    },
+    missions: {
+      do: blueprint,
+      protect: { mode: "guard", title: "保护", steps: [{ type: "protect" }] },
+      stop: { mode: "stop", title: "停下", steps: [{ type: "stop" }] },
+    },
+  };
+}
+
+function readSteps(root: Record<string, unknown>): ActionIntent[] {
+  const direct = asStepList(root.steps ?? root.actions ?? root.plan);
+  if (direct.length) return direct;
+  const mission = root.mission;
+  if (mission && typeof mission === "object" && !Array.isArray(mission)) {
+    const nested = asStepList((mission as Record<string, unknown>).steps);
+    if (nested.length) return nested;
+  }
+  if (root.type || root.action) return asStepList([root]);
+  const missions = root.missions;
+  if (missions && typeof missions === "object") {
+    const entries = Array.isArray(missions) ? missions : Object.values(missions as Record<string, unknown>);
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object") continue;
+      const nested = asStepList((entry as Record<string, unknown>).steps);
+      if (nested.length) return nested;
+    }
+  }
+  const skill = String(root.skill ?? "");
+  return skill ? stepsFromSkill(skill, root) : [];
+}
+
+function asStepList(value: unknown): ActionIntent[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(sanitizeIntent).filter((step): step is ActionIntent => Boolean(step)).slice(0, 12);
+}
+
+function stepsFromSkill(skill: string, root: Record<string, unknown>): ActionIntent[] {
+  const id = skill.trim().toLowerCase();
+  if (!id || id === "clarify") return [];
+  if (id === "follow" || id === "stop" || id === "sit" || id === "protect") return [{ type: id }];
+  if (id === "status") return [{ type: "wait" }];
+  if (id.includes("attack") || id.includes("hunt")) {
+    const entity = typeof root.entity === "string" ? normalizeEntity(root.entity) : undefined;
+    return [{ type: "attack", entity, label: entity ? mobLabel(entity) : "附近的怪物" }];
+  }
+  if (id.includes("build") || id.includes("cabin")) {
+    return [
+      { type: "collect", block: "oak_log", count: 8, label: "木头" },
+      { type: "come" },
+      { type: "build", template: "cabin", label: "小木屋" },
+    ];
+  }
+  const type = normalizeType(id);
+  return type ? [{ type }] : [];
+}
+
+function readMode(value: unknown, steps: ActionIntent[]): MissionMode {
+  const text = String(value ?? "").trim().toLowerCase();
+  const alias: Record<string, MissionMode> = {
+    focused: "focused", follow: "follow", guard: "guard", hunt: "hunt", idle: "idle", stop: "stop", sit: "sit",
+    跟着: "follow", 跟随: "follow", 保护: "guard", 攻击: "hunt", 进攻: "hunt", 坐下: "sit", 停下: "stop",
+  };
+  if (alias[text] || modes.includes(text as MissionMode)) return (alias[text] ?? text) as MissionMode;
+  const types = new Set(steps.map((step) => step.type));
+  if (types.has("sit")) return "sit";
+  if ([...types].every((type) => type === "attack" || type === "hunt")) return "hunt";
+  if (types.size === 1 && types.has("follow")) return "follow";
+  if (types.size === 1 && types.has("protect")) return "guard";
+  if (types.has("stop")) return "stop";
+  return "focused";
 }
 
 function sanitizeIntent(value: unknown): ActionIntent | undefined {
+  if (typeof value === "string") return intentFromText(value);
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
-  const type = String(raw.type ?? "").trim().toLowerCase().slice(0, 32);
+  const type = normalizeType(String(raw.type ?? raw.action ?? ""));
   if (!type) return undefined;
   const intent: ActionIntent = { type };
-  if (typeof raw.block === "string") intent.block = raw.block.trim().slice(0, 40);
-  if (typeof raw.entity === "string") intent.entity = raw.entity.trim().slice(0, 40);
-  if (typeof raw.item === "string") intent.item = raw.item.trim().slice(0, 40);
-  if (typeof raw.template === "string") intent.template = raw.template.trim().slice(0, 40);
+  if (typeof raw.block === "string") intent.block = normalizeBlock(raw.block);
+  if (typeof raw.entity === "string") intent.entity = normalizeEntity(raw.entity);
+  if (typeof raw.item === "string") intent.item = normalizeBlock(raw.item);
+  if (typeof raw.template === "string" && templates.includes(raw.template as BuildTemplate)) intent.template = raw.template;
   if (typeof raw.label === "string") intent.label = raw.label.trim().slice(0, 20);
-  if (typeof raw.count === "number" && Number.isFinite(raw.count)) intent.count = Math.min(24, Math.max(1, Math.round(raw.count)));
+  const count = typeof raw.count === "string" ? Number(raw.count) : raw.count;
+  if (typeof count === "number" && Number.isFinite(count)) intent.count = Math.min(24, Math.max(1, Math.round(count)));
   for (const axis of ["x", "y", "z"] as const) {
     const n = raw[axis];
     if (typeof n === "number" && Number.isFinite(n)) intent[axis] = Math.round(n);
@@ -125,30 +193,81 @@ function sanitizeIntent(value: unknown): ActionIntent | undefined {
   return intent;
 }
 
-function sanitizeActionId(value: string): string | undefined {
-  const id = value.trim().slice(0, 40);
-  if (!id || /[^\p{L}\p{N}_-]/u.test(id)) return undefined;
-  return id;
+function intentFromText(text: string): ActionIntent | undefined {
+  const type = normalizeType(text);
+  if (type) return { type };
+  const [head, block, count] = text.trim().split(/\s+/);
+  const mapped = normalizeType(head ?? "");
+  if (!mapped) return undefined;
+  const intent: ActionIntent = { type: mapped };
+  if (block) intent.block = normalizeBlock(block);
+  if (count && Number.isFinite(Number(count))) intent.count = Math.min(24, Math.max(1, Math.round(Number(count))));
+  return intent;
+}
+
+const TYPE_ALIAS: Record<string, string> = {
+  follow: "follow", 跟随: "follow", 跟着: "follow", 跟着我: "follow",
+  stop: "stop", 停下: "stop", 停止: "stop", 别动: "stop",
+  protect: "protect", 保护: "protect", 保护我: "protect",
+  collect: "collect", mine: "collect", harvest: "collect", 采集: "collect", 挖: "collect", 砍: "collect", 砍树: "collect",
+  attack: "attack", hunt: "attack", 攻击: "attack", 打: "attack", 打怪: "attack",
+  build: "build", 建造: "build", 盖: "build",
+  place: "place", 放置: "place",
+  give: "give", toss: "give", 给: "give", 递: "give",
+  come: "come", 过来: "come", 回来: "come",
+  look: "look", 看: "look",
+  dance: "dance", jump: "dance", 跳: "dance", 跳舞: "dance",
+  eat: "eat", 吃: "eat",
+  goto: "goto", 去: "goto",
+  sit: "sit", rest: "sit", sneak: "sit", 坐下: "sit", 蹲下: "sit",
+  wait: "wait", 等: "wait",
+  find: "find", 找: "find",
+  explore: "explore", 探索: "explore",
+  status: "wait",
+};
+
+function normalizeType(raw: string): string {
+  const text = raw.trim().toLowerCase();
+  if (!text) return "";
+  if (TYPE_ALIAS[text]) return TYPE_ALIAS[text];
+  if (TYPE_ALIAS[raw.trim()]) return TYPE_ALIAS[raw.trim()];
+  return "";
+}
+
+const BLOCK_ALIAS: Record<string, string> = {
+  木头: "oak_log", 原木: "oak_log", 树: "oak_log", 树木: "oak_log", wood: "oak_log",
+  石头: "stone", 圆石: "cobblestone",
+  煤: "coal_ore", 煤矿: "coal_ore", coal: "coal_ore",
+  铁: "iron_ore", 铁矿: "iron_ore", iron: "iron_ore",
+  花: "dandelion", 火把: "torch",
+};
+
+function normalizeBlock(name: string): string {
+  const text = name.trim();
+  return (BLOCK_ALIAS[text] ?? BLOCK_ALIAS[text.toLowerCase()] ?? text.replace(/^minecraft:/, "")).slice(0, 40);
+}
+
+function normalizeEntity(name: string): string | undefined {
+  const known = parseMob(name);
+  if (known) return known.id;
+  const raw = name.trim().toLowerCase().replace(/^minecraft:/, "");
+  return raw ? raw.slice(0, 40) : undefined;
+}
+
+function clip(value: unknown, max: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  return text ? text.slice(0, max) : undefined;
 }
 
 function inferMode(id: string): MissionMode {
   if (id === "stop") return "stop";
   if (id === "protect") return "guard";
   if (id === "follow") return "follow";
-  if (id === "sit" || id === "rest" || id === "sneak") return "sit";
-  if (id === "attack" || id === "hunt") return "hunt";
+  if (id === "sit") return "sit";
+  if (id === "attack") return "hunt";
   if (id === "clarify" || id === "status") return "idle";
   return "focused";
-}
-
-function fallbackStep(id: string, resource: unknown, template: unknown, entity?: unknown): ActionIntent {
-  if (id === "find_resource") return { type: "collect", block: String(resource ?? "wood"), count: 8, label: String(resource ?? "木头") };
-  if (id === "build") return { type: "build", template: String(template ?? "cabin") };
-  if (id === "attack" || id === "hunt") {
-    const name = typeof entity === "string" && entity ? entity : undefined;
-    return { type: "attack", entity: name, label: name ? mobLabel(name) : "附近的怪物" };
-  }
-  return { type: id };
 }
 
 function withDefaultMissions(task: ReturnType<typeof localPlan>): Plan {

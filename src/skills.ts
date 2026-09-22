@@ -85,6 +85,50 @@ export class Skills {
     return hostile ? hostile.position.distanceTo(this.bot.entity.position) : undefined;
   }
 
+  threatNear(position: Vec3, radius: number): { name: string; distance: number } | undefined {
+    let closest: { name: string; distance: number } | undefined;
+    for (const entity of Object.values(this.bot.entities)) {
+      if (entity.type !== "mob" || !entity.name || !this.isHostile(entity.name)) continue;
+      const distance = entity.position.distanceTo(position);
+      if (distance > radius) continue;
+      if (!closest || distance < closest.distance) closest = { name: entity.name, distance };
+    }
+    return closest;
+  }
+
+  async helpGather(blockName: string, playerName: string, radius: number, avoid?: Vec3): Promise<StepResult> {
+    const player = this.bot.players[playerName]?.entity;
+    if (!player) return { status: "blocked", message: "我现在看不到你。" };
+    const names = this.resolveBlocks(blockName);
+    const ids = names.map((name) => this.bot.registry.blocksByName[name]?.id).filter((id): id is number => id !== undefined);
+    if (!ids.length || !this.bot.collectBlock) return { status: "done" };
+    const positions = this.bot.findBlocks({ matching: ids, maxDistance: radius + 8, count: 12 });
+    const target = positions
+      .map((pos) => this.bot.blockAt(pos))
+      .filter((block): block is NonNullable<typeof block> => Boolean(block))
+      .filter((block) => block.position.distanceTo(player.position) <= radius)
+      .filter((block) => !avoid || block.position.distanceTo(avoid) > 1.2)
+      .sort((a, b) => a.position.distanceTo(player.position) - b.position.distanceTo(player.position))[0];
+    if (!target) return { status: "done" };
+    try {
+      this.bot.pathfinder.setMovements(new Movements(this.bot));
+      await this.bot.collectBlock.collect(target, { ignoreNoPath: true });
+      return { status: "progress" };
+    } catch (error) {
+      console.warn("配合采集失败：", error);
+      return { status: "done" };
+    }
+  }
+
+  async lightNear(playerName: string): Promise<StepResult> {
+    const player = this.bot.players[playerName]?.entity;
+    if (!player) return { status: "blocked" };
+    if (player.position.distanceTo(this.bot.entity.position) > 5) return this.come(playerName);
+    const already = this.bot.findBlock({ matching: (block) => block.name === "torch" || block.name === "soul_torch", maxDistance: 6 });
+    if (already && already.position.distanceTo(player.position) < 6) return { status: "done" };
+    return this.place({ type: "place", item: "torch", label: "火把" });
+  }
+
   countItems(names: string[]): number {
     if (!names.length) return 0;
     return this.bot.inventory.items().filter((item) => names.includes(item.name)).reduce((sum, item) => sum + item.count, 0);
