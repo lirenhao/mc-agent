@@ -41,10 +41,15 @@ export class Skills {
   constructor(private readonly bot: Bot) {}
 
   stop(): void {
+    if (this.bot.isSleeping) void this.bot.wake().catch(() => undefined);
     this.bot.pathfinder.setGoal(null);
     this.bot.clearControlStates();
     this.buildCursor = undefined;
     void this.bot.collectBlock?.cancelTask();
+  }
+
+  bedNearby(maxDistance = 32): boolean {
+    return Boolean(this.nearestBed(maxDistance));
   }
 
   keepFollow(playerName: string, distance = 3): boolean {
@@ -172,6 +177,7 @@ export class Skills {
     if (type === "eat") return this.eat();
     if (type === "look") return this.look(playerName);
     if (type === "sit" || type === "sneak" || type === "rest") return this.sit(playerName);
+    if (type === "sleep") return this.sleepNight();
     if (intent.block || intent.item) return this.collectOne({ ...intent, type: "collect" });
     if (intent.entity) return this.attack(intent);
     return this.explore();
@@ -357,6 +363,52 @@ export class Skills {
       console.warn("进食失败：", error);
       return { status: "blocked", message: "我现在吃不了。" };
     }
+  }
+
+  private async sleepNight(): Promise<StepResult> {
+    const night = this.canSleepNow();
+    if (this.bot.isSleeping) {
+      if (night) return { status: "progress" };
+      try { await this.bot.wake(); } catch { /* already waking */ }
+      return { status: "done", message: "天亮了，我起来了。" };
+    }
+    if (!night) return { status: "done", message: "现在是白天，不用睡觉。" };
+    const bed = this.nearestBed(48);
+    if (!bed) return { status: "blocked", message: "附近没有床，放一张床我才能睡觉。" };
+    if (bed.position.distanceTo(this.bot.entity.position) > 2) {
+      this.bot.pathfinder.setMovements(new Movements(this.bot));
+      this.bot.pathfinder.setGoal(new goals.GoalNear(bed.position.x, bed.position.y, bed.position.z, 1));
+      return { status: "progress", message: "我去床上睡觉。" };
+    }
+    this.bot.pathfinder.setGoal(null);
+    try {
+      await this.bot.sleep(bed);
+      return { status: "progress", message: "我躺下了。你也上床，我们就能到天亮。" };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (message.includes("monsters")) return { status: "blocked", message: "床边有怪物，我先睡不了。" };
+      if (message.includes("occupied")) return { status: "blocked", message: "这张床有人了。" };
+      if (message.includes("not night")) return { status: "done", message: "现在是白天，不用睡觉。" };
+      if (message.includes("too far") || message.includes("cant click") || message.includes("half bed")) {
+        this.bot.pathfinder.setGoal(new goals.GoalNear(bed.position.x, bed.position.y, bed.position.z, 1));
+        return { status: "progress", message: "我再靠近床一点。" };
+      }
+      console.warn("睡觉失败：", error);
+      return { status: "blocked", message: "我现在睡不了。" };
+    }
+  }
+
+  private canSleepNow(): boolean {
+    const time = this.bot.time.timeOfDay;
+    const thunder = this.bot.isRaining && this.bot.thunderState > 0;
+    return thunder || (time >= 12541 && time <= 23458);
+  }
+
+  private nearestBed(maxDistance: number) {
+    return this.bot.findBlock({
+      matching: (block) => this.bot.isABed(block),
+      maxDistance,
+    });
   }
 
   private sit(playerName: string): StepResult {

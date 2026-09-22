@@ -3,7 +3,7 @@ import { DEFAULT_CRITERIA, SKILL_NAMES, type ActionIntent, type BuildTemplate, t
 
 const resources: ResourceName[] = ["wood", "stone", "coal", "iron"];
 const templates: BuildTemplate[] = ["cabin", "farm", "camp"];
-const modes: MissionMode[] = ["focused", "follow", "guard", "idle", "stop", "sit", "hunt"];
+const modes: MissionMode[] = ["focused", "follow", "guard", "idle", "stop", "sit", "hunt", "sleep"];
 
 export async function planMission(transcript: string, state: WorldState): Promise<Plan> {
   if (!config.llm.baseUrl || !config.llm.apiKey || !config.llm.model) {
@@ -21,9 +21,10 @@ export async function planMission(transcript: string, state: WorldState): Promis
           {
             role: "system",
             content: `你是 Minecraft 陪玩 ${config.persona.name}。风格：${config.persona.style}。只输出一个 JSON 对象，不要 markdown。
-格式：{"reply":"不超过35字","mode":"focused|follow|guard|hunt|sit|stop|idle","title":"短标题","steps":[{"type":"collect","block":"oak_log","count":8,"label":"木头"}]}
-type 只能是：follow, stop, protect, collect, attack, build, place, give, come, look, dance, eat, goto, sit, wait。
-mode：follow=一直跟着；guard=保护；hunt=一直进攻直到停下；sit=坐下陪着；stop=停下；focused=按 steps 做完再回来。
+格式：{"reply":"不超过35字","mode":"focused|follow|guard|hunt|sit|sleep|stop|idle","title":"短标题","steps":[{"type":"collect","block":"oak_log","count":8,"label":"木头"}]}
+type 只能是：follow, stop, protect, collect, attack, build, place, give, come, look, dance, eat, goto, sit, sleep, wait。
+mode：follow=一直跟着；guard=保护；hunt=一直进攻直到停下；sit=坐下陪着；sleep=上床睡觉直到天亮；stop=停下；focused=按 steps 做完再回来。
+孩子要睡觉或跳过夜晚时，type=sleep，mode=sleep。附近要有床；孩子也上床，夜晚才会过去。
 多件事拆成有序 steps。例如砍树盖房：collect oak_log → come → build，template 只能是 cabin、farm、camp。
 block/item 用英文 id（木头用 oak_log，石头用 stone，煤用 coal_ore，铁用 iron_ore，花用 dandelion）。
 攻击时 type=attack，mode=hunt，entity 用 zombie、skeleton、spider、creeper 等；没点名就省略 entity。不要攻击玩家或村民。
@@ -40,6 +41,7 @@ block/item 用英文 id（木头用 oak_log，石头用 stone，煤用 coal_ore�
               inventory: state.inventory.slice(0, 8),
               childNearby: state.childVisible,
               doing: state.mission?.title,
+              recent: state.recent?.slice(-5) ?? [],
             }),
           },
         ],
@@ -140,6 +142,7 @@ function stepsFromSkill(skill: string, root: Record<string, unknown>): ActionInt
   const id = skill.trim().toLowerCase();
   if (!id || id === "clarify") return [];
   if (id === "follow" || id === "stop" || id === "sit" || id === "protect") return [{ type: id }];
+  if (id === "sleep") return [{ type: "sleep", label: "睡觉" }];
   if (id === "status") return [{ type: "wait" }];
   if (id.includes("attack") || id.includes("hunt")) {
     const entity = typeof root.entity === "string" ? normalizeEntity(root.entity) : undefined;
@@ -159,12 +162,13 @@ function stepsFromSkill(skill: string, root: Record<string, unknown>): ActionInt
 function readMode(value: unknown, steps: ActionIntent[]): MissionMode {
   const text = String(value ?? "").trim().toLowerCase();
   const alias: Record<string, MissionMode> = {
-    focused: "focused", follow: "follow", guard: "guard", hunt: "hunt", idle: "idle", stop: "stop", sit: "sit",
-    跟着: "follow", 跟随: "follow", 保护: "guard", 攻击: "hunt", 进攻: "hunt", 坐下: "sit", 停下: "stop",
+    focused: "focused", follow: "follow", guard: "guard", hunt: "hunt", idle: "idle", stop: "stop", sit: "sit", sleep: "sleep",
+    跟着: "follow", 跟随: "follow", 保护: "guard", 攻击: "hunt", 进攻: "hunt", 坐下: "sit", 停下: "stop", 睡觉: "sleep",
   };
   if (alias[text] || modes.includes(text as MissionMode)) return (alias[text] ?? text) as MissionMode;
   const types = new Set(steps.map((step) => step.type));
   if (types.has("sit")) return "sit";
+  if (types.has("sleep")) return "sleep";
   if ([...types].every((type) => type === "attack" || type === "hunt")) return "hunt";
   if (types.size === 1 && types.has("follow")) return "follow";
   if (types.size === 1 && types.has("protect")) return "guard";
@@ -220,6 +224,7 @@ const TYPE_ALIAS: Record<string, string> = {
   eat: "eat", 吃: "eat",
   goto: "goto", 去: "goto",
   sit: "sit", rest: "sit", sneak: "sit", 坐下: "sit", 蹲下: "sit",
+  sleep: "sleep", 睡觉: "sleep", 上床: "sleep", 过夜: "sleep",
   wait: "wait", 等: "wait",
   find: "find", 找: "find",
   explore: "explore", 探索: "explore",
@@ -265,6 +270,7 @@ function inferMode(id: string): MissionMode {
   if (id === "protect") return "guard";
   if (id === "follow") return "follow";
   if (id === "sit") return "sit";
+  if (id === "sleep") return "sleep";
   if (id === "attack") return "hunt";
   if (id === "clarify" || id === "status") return "idle";
   return "focused";
@@ -283,6 +289,10 @@ function withDefaultMissions(task: ReturnType<typeof localPlan>): Plan {
   if (task.skill === "sit") {
     criteria.sit = "孩子想坐下、蹲下或一起休息。";
     missions.sit = { mode: "sit", title: "坐下陪着", steps: [{ type: "come" }, { type: "sit" }] };
+  }
+  if (task.skill === "sleep") {
+    criteria.sleep = "孩子要上床睡觉，跳过夜晚。";
+    missions.sleep = { mode: "sleep", title: "睡觉", steps: [{ type: "sleep", label: "睡觉" }] };
   }
   if (task.skill === "attack") {
     criteria.attack = "孩子要主动进攻附近的生物。";
@@ -329,6 +339,7 @@ function isTimeout(error: unknown): boolean {
 }
 
 function localPlan(text: string): Omit<Plan, "criteria" | "missions"> {
+  if (/(睡觉|去睡|上床|跳过夜晚|睡到天亮|过夜)/.test(text)) return { skill: "sleep", reply: "好，我去床上睡觉。你也上床，我们就能到天亮。" };
   if (/(坐下|蹲下|坐着|坐下来|休息一下)/.test(text)) return { skill: "sit", reply: "好，我坐下来陪你。" };
   if (/(停|别动|停止)/.test(text)) return { skill: "stop", reply: "好，我停在这里等你。" };
   if (/(跟着|跟我|跟随)/.test(text)) return { skill: "follow", reply: "好，我跟着你。" };

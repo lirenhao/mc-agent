@@ -1,7 +1,7 @@
 export type SkillName = "follow" | "find_resource" | "protect" | "build" | "stop" | "status" | "clarify";
 export type ResourceName = "wood" | "stone" | "coal" | "iron";
 export type BuildTemplate = "cabin" | "farm" | "camp";
-export type MissionMode = "focused" | "follow" | "guard" | "idle" | "stop" | "sit" | "hunt";
+export type MissionMode = "focused" | "follow" | "guard" | "idle" | "stop" | "sit" | "hunt" | "sleep";
 
 export const SKILL_NAMES: SkillName[] = ["follow", "find_resource", "protect", "build", "stop", "status", "clarify"];
 
@@ -72,4 +72,5 @@ export type WorldState = {
   childVisible: boolean;
   childDistance?: number;
   mission?: { title: string; step: number; total: number; current?: string };
+  recent?: Array<{ action: string; result: string }>;
 };
