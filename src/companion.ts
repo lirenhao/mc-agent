@@ -24,6 +24,7 @@ export class Companion {
   private busy = false;
   private planning = false;
   private pending?: Pending;
+  private active?: Pending;
   private stayPut = false;
   private emergency = false;
   private lastChat = 0;
@@ -36,6 +37,8 @@ export class Companion {
   private failures = 0;
   private lastPlanAt = 0;
   private planGeneration = 0;
+  private workToken = 0;
+  private decisionToken = 0;
   private nextDecisionAt = 0;
   private holding?: Offer;
   private deciding = false;
@@ -62,6 +65,8 @@ export class Companion {
     this.timer = undefined;
     this.pending?.resolve("我掉线了，正在重新连接。");
     this.pending = undefined;
+    this.active?.resolve("我掉线了，正在重新连接。");
+    this.active = undefined;
     try {
       this.skills.stop();
     } catch (error) {
@@ -71,10 +76,31 @@ export class Companion {
 
   instruct(text: string, playerName: string): Promise<string> {
     return new Promise((resolve) => {
-      this.pending?.resolve("好，我改听新的。");
+      this.planGeneration += 1;
+      const working = Boolean(this.mission || this.busy || (this.holding && this.holding.key !== "follow"));
+      this.cutOff();
+      if (working) this.say("好，先停下来听新的。", true);
+      const replaced = "好，我改听新的。";
+      this.pending?.resolve(replaced);
+      this.active?.resolve(replaced);
+      this.active = undefined;
       this.pending = { text, playerName, resolve };
       void this.flushPlan();
     });
+  }
+
+  private cutOff(): void {
+    this.workToken += 1;
+    this.decisionToken += 1;
+    this.skills.stop();
+    this.mission = undefined;
+    this.holding = undefined;
+    this.nextDecisionAt = 0;
+    this.stayPut = false;
+    this.stuck = 0;
+    this.busy = false;
+    this.deciding = false;
+    this.failures = 0;
   }
 
   private childName(): string {
@@ -90,25 +116,32 @@ export class Companion {
     this.planning = true;
     const current = this.pending;
     this.pending = undefined;
+    this.active = current;
     try {
       const message = await this.adopt(current.text, current.playerName);
-      current.resolve(message);
+      if (this.active === current) current.resolve(message);
     } catch (error) {
       console.error("规划任务失败：", error);
-      current.resolve("我现在有点乱，请再说一次。");
+      if (this.active === current) current.resolve("我现在有点乱，请再说一次。");
     } finally {
+      if (this.active === current) this.active = undefined;
       this.planning = false;
       if (this.pending) void this.flushPlan();
     }
   }
 
   private async adopt(text: string, playerName: string): Promise<string> {
-    const generation = ++this.planGeneration;
+    const generation = this.planGeneration;
     this.lastPlanAt = Date.now();
     this.failures = 0;
     const state = this.snapshot();
     const plan = await planMission(text, state);
+    if (generation !== this.planGeneration) return plan.reply;
     const chosen = await chooseMission(plan, state);
+    if (generation !== this.planGeneration) return plan.reply;
+    this.skills.stop();
+    this.stuck = 0;
+    this.holding = undefined;
     if (chosen === "status") {
       const message = this.skills.status(state);
       this.say(message, true);
@@ -118,10 +151,6 @@ export class Companion {
       this.say(plan.reply, true);
       return plan.reply;
     }
-    this.skills.stop();
-    this.stuck = 0;
-    this.holding = undefined;
-    if (generation !== this.planGeneration) return plan.reply;
     if (chosen === "stop") {
       this.mission = undefined;
       this.stayPut = true;
@@ -159,6 +188,7 @@ export class Companion {
     const state = this.snapshot();
 
     if (await this.handleEmergency(state, playerName)) return;
+    if (this.planning) return;
     this.noticeNight(state);
     this.queueBackgroundPlan(state);
     if (this.busy) return;
@@ -226,6 +256,8 @@ export class Companion {
   }
 
   private async decide(playerName: string, state: WorldState): Promise<void> {
+    const generation = this.planGeneration;
+    const token = ++this.decisionToken;
     this.deciding = true;
     this.nextDecisionAt = Date.now() + DECISION_MS;
     try {
@@ -260,16 +292,14 @@ export class Companion {
         this.skills.keepFollow(playerName, 3);
         return;
       }
-      const offer = await chooseOffer(offers, {
-        recent: this.recent,
-        summary: `${state.mission ? `任务${state.mission.title}，第${state.mission.step}/${state.mission.total}步` : "没有长任务"}，生命${state.health}，${state.time === "night" ? "夜晚" : "白天"}`,
-      });
+      const offer = await chooseOffer(offers, state);
+      if (generation !== this.planGeneration || token !== this.decisionToken) return;
       console.log(`选择 ${offer.key}：${offer.description}`);
       this.holding = offer;
       if (!offer.sustain) this.nextDecisionAt = 0;
       await this.runOffer(offer, playerName, state, false);
     } finally {
-      this.deciding = false;
+      if (token === this.decisionToken) this.deciding = false;
     }
   }
 
@@ -290,12 +320,10 @@ export class Companion {
       }
       if (this.busy) return true;
       if (threatNearChild && threatNearChild.name !== "creeper") {
-        this.busy = true;
-        try {
-          await this.skills.progress({ type: "attack", entity: threatNearChild.name, label: threatNearChild.name }, playerName, state);
-        } finally {
-          this.busy = false;
-        }
+        const name = threatNearChild.name;
+        await this.withWork(async () => {
+          await this.skills.progress({ type: "attack", entity: name, label: name }, playerName, state);
+        });
       } else {
         this.skills.protectOnce(playerName);
       }
@@ -325,6 +353,9 @@ export class Companion {
   }
 
   private async runOffer(offer: Offer, playerName: string, state: WorldState, quiet: boolean): Promise<void> {
+    const generation = this.planGeneration;
+    const token = this.workToken;
+    const current = (): boolean => this.fresh(generation, token);
     const key = offer.key;
     if (key === "follow") {
       this.skills.keepFollow(playerName, state.time === "night" ? 2 : 4);
@@ -341,6 +372,7 @@ export class Companion {
     if (key === "sleep") {
       await this.withWork(async () => {
         const result = await this.skills.progress({ type: "sleep", label: "睡觉" }, playerName, state);
+        if (!current()) return;
         this.noteResult(key, result, quiet);
         if (result.status !== "progress") {
           this.holding = undefined;
@@ -355,6 +387,7 @@ export class Companion {
         return;
       }
       const result = await this.skills.progress({ type: "sit" }, playerName, state);
+      if (!current()) return;
       this.skills.keepSit(playerName);
       this.noteResult(key, result, quiet);
       return;
@@ -363,6 +396,7 @@ export class Companion {
       this.lastTorch = Date.now();
       await this.withWork(async () => {
         const result = await this.skills.lightNear(playerName);
+        if (!current()) return;
         this.noteResult(key, result, quiet);
       });
       return;
@@ -377,8 +411,10 @@ export class Companion {
           key.startsWith("mine:") ? 10 : 14,
           this.assist.kind === "mine" ? this.assist.avoid : undefined,
         );
+        if (!current()) return;
         this.noteResult(key, result, quiet);
       });
+      if (!current()) return;
       this.nextDecisionAt = 0;
       return;
     }
@@ -398,6 +434,7 @@ export class Companion {
     }
     await this.withWork(async () => {
       const result = await this.skills.progress(offer.intent, playerName, state);
+      if (!current()) return;
       this.trackProgress();
       this.noteResult(key, result, quiet);
       if (this.sticky(offer) || !this.mission) return;
@@ -415,16 +452,21 @@ export class Companion {
     });
   }
 
+  private fresh(generation: number, token: number): boolean {
+    return generation === this.planGeneration && token === this.workToken;
+  }
+
   private sticky(offer: Offer): boolean {
     return ["sit", "attack", "hunt", "protect", "follow", "retreat"].includes(offer.intent.type.toLowerCase());
   }
 
   private async withWork(work: () => Promise<void>): Promise<void> {
+    const token = this.workToken;
     this.busy = true;
     try {
       await work();
     } finally {
-      this.busy = false;
+      if (token === this.workToken) this.busy = false;
     }
   }
 
