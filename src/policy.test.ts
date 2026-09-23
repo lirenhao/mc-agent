@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildOffers, failureCooldown, filterOffers, planTrigger, preferOffer } from "./actions.js";
+import { buildOffers, failureCooldown, filterOffers, planTrigger, preferOffer, type Offer } from "./actions.js";
+import { selectJudgedOffer } from "./jev.js";
 
 test("danger leaves only retreat and protect", () => {
   const offers = buildOffers({
@@ -44,6 +45,17 @@ test("night sleep is offered, and danger drops it", () => {
   const filtered = filterOffers(offers, { unsafe: true, cooled: new Set() });
   assert.deepEqual(filtered.map((offer) => offer.key), ["retreat", "protect"]);
   assert.equal(preferOffer(offers.filter((offer) => offer.key !== "retreat" && offer.key !== "protect")).key, "follow");
+});
+
+test("Jev action keys execute directly, and an unsure stop does not", () => {
+  const offers: Offer[] = [
+    { key: "mission:collect:oak_log", description: "继续砍树", intent: { type: "collect", block: "oak_log" }, sustain: false },
+    { key: "follow", description: "跟着孩子", intent: { type: "follow" }, sustain: true },
+    { key: "stop", description: "停下", intent: { type: "stop" }, sustain: true },
+  ];
+  assert.equal(selectJudgedOffer(offers, "mission:collect:oak_log", 0.42, 0.85).key, "mission:collect:oak_log");
+  assert.equal(selectJudgedOffer(offers, "stop", 0.4, 0.85).key, "mission:collect:oak_log");
+  assert.equal(selectJudgedOffer(offers, "not-an-action", 0.99, 0.85).key, "mission:collect:oak_log");
 });
 
 test("repeated failure asks for a new plan, a fresh mission does not", () => {

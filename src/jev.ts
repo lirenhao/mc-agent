@@ -5,9 +5,17 @@ import type { Plan, WorldState } from "./types.js";
 
 const HIGH_STAKES = new Set(["retreat", "protect", "stop"]);
 
+export function selectJudgedOffer(offers: Offer[], choice: string | undefined, confidence: number, minConfidence: number): Offer {
+  const unique = uniqueOffers(offers);
+  const offer = unique.find((item) => item.key === choice);
+  if (!offer || (HIGH_STAKES.has(offer.key) && confidence < minConfidence)) return preferOffer(unique);
+  return offer;
+}
+
 export async function chooseOffer(offers: Offer[], state: WorldState): Promise<Offer> {
-  if (offers.length === 1 || !config.jev.apiKey) return preferOffer(offers);
-  const criteria = Object.fromEntries(offers.map((offer, index) => [`a${index}`, offerCriterion(offer, state.time === "night")]));
+  const unique = uniqueOffers(offers);
+  if (unique.length === 1 || !config.jev.apiKey) return preferOffer(unique);
+  const criteria = Object.fromEntries(unique.map((offer) => [offer.key, offerCriterion(offer, state.time === "night")]));
   try {
     const response = await fetch(config.jev.endpoint, {
       method: "POST",
@@ -18,7 +26,7 @@ export async function chooseOffer(offers: Offer[], state: WorldState): Promise<O
         questions: {
           action: {
             type: "choice",
-            instructions: "Choose the single available action that best continues the companion's current goal.",
+            instructions: "Choose the one legal action that best advances `mission` when a task is active. If `recent` shows that action failed, choose a different legal action. Follow the child when no task needs attention.",
             criteria,
           },
         },
@@ -27,18 +35,14 @@ export async function chooseOffer(offers: Offer[], state: WorldState): Promise<O
     });
     if (!response.ok) throw new Error(`Jev ${response.status}: ${(await response.text()).slice(0, 300)}`);
     const picked = readChoice(await response.json(), "action");
-    const index = picked ? choiceIndex(picked.choice, offers.length) : undefined;
-    if (index === undefined || !picked) return preferOffer(offers);
-    const offer = offers[index];
-    if (HIGH_STAKES.has(offer.key) && picked.confidence < config.jev.minConfidence) {
-      console.log(`Jev 想选 ${offer.key}，置信度 ${picked.confidence.toFixed(2)}，改用本地优先级`);
-      return preferOffer(offers);
-    }
-    console.log(`Jev 选择 ${offer.key}，置信度 ${picked.confidence.toFixed(2)}`);
+    const offer = selectJudgedOffer(unique, picked?.choice, picked?.confidence ?? 0, config.jev.minConfidence);
+    const confidence = (picked?.confidence ?? 0).toFixed(2);
+    if (picked?.choice === offer.key) console.log(`Jev 选择 ${offer.key}，置信度 ${confidence}`);
+    else console.log(`Jev 想选 ${picked?.choice ?? "无"}，置信度 ${confidence}，改用 ${offer.key}`);
     return offer;
   } catch (error) {
     console.error("Jev 选择失败，使用本地优先级：", error);
-    return preferOffer(offers);
+    return preferOffer(unique);
   }
 }
 
@@ -153,8 +157,11 @@ function readChoice(value: unknown, question: string): { choice: string; confide
   return { choice, confidence: Number.isFinite(confidence) ? confidence : 0 };
 }
 
-function choiceIndex(choice: string, count: number): number | undefined {
-  if (!/^a\d+$/.test(choice)) return undefined;
-  const index = Number(choice.slice(1));
-  return index >= 0 && index < count ? index : undefined;
+function uniqueOffers(offers: Offer[]): Offer[] {
+  const seen = new Set<string>();
+  return offers.filter((offer) => {
+    if (seen.has(offer.key)) return false;
+    seen.add(offer.key);
+    return true;
+  });
 }
