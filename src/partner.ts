@@ -1,6 +1,7 @@
 import type { Block } from "prismarine-block";
 import type { Bot } from "mineflayer";
 import type { Vec3 } from "vec3";
+import { isHostileEntity } from "./mobs.js";
 
 export type Assist =
   | { kind: "follow" }
@@ -58,8 +59,7 @@ export class Partner {
 function nearestThreat(bot: Bot, position: Vec3, radius: number): { name: string } | undefined {
   let best: { name: string; distance: number } | undefined;
   for (const entity of Object.values(bot.entities)) {
-    if (entity.type !== "mob" || !entity.name) continue;
-    if (!["zombie", "skeleton", "spider", "witch", "drowned", "husk", "creeper", "slime"].includes(entity.name)) continue;
+    if (!isHostileEntity(entity) || !entity.name) continue;
     const distance = entity.position.distanceTo(position);
     if (distance > radius) continue;
     if (!best || distance < best.distance) best = { name: entity.name, distance };

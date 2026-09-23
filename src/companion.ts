@@ -45,6 +45,7 @@ export class Companion {
   private refreshing = false;
   private noUseful = false;
   private assist: Assist = { kind: "follow" };
+  private childOverride = "";
   private recent: RecentAction[] = [];
   private readonly cooled = new Map<string, number>();
   private timer?: NodeJS.Timeout;
@@ -72,6 +73,10 @@ export class Companion {
     } catch (error) {
       console.warn("停止动作失败：", error);
     }
+  }
+
+  focus(playerName: string): void {
+    if (playerName) this.childOverride = playerName;
   }
 
   instruct(text: string, playerName: string): Promise<string> {
@@ -104,7 +109,7 @@ export class Companion {
   }
 
   private childName(): string {
-    return config.companionPlayer ?? "";
+    return config.companionPlayer || this.childOverride;
   }
 
   private snapshot(): WorldState {
@@ -137,6 +142,7 @@ export class Companion {
     const state = this.snapshot();
     const plan = await planMission(text, state);
     if (generation !== this.planGeneration) return plan.reply;
+    if (plan.skill === "tp") return this.teleportNow(playerName, state, generation, plan.reply);
     const chosen = await chooseMission(plan, state);
     if (generation !== this.planGeneration) return plan.reply;
     this.skills.stop();
@@ -161,6 +167,19 @@ export class Companion {
     const blueprint = plan.missions[chosen] ?? fallbackBlueprint(chosen, plan);
     this.mission = this.createMission(chosen, plan.reply, blueprint);
     const message = plan.reply;
+    this.say(message, true);
+    return message;
+  }
+
+  private async teleportNow(playerName: string, state: WorldState, generation: number, reply: string): Promise<string> {
+    this.skills.stop();
+    this.mission = undefined;
+    this.holding = undefined;
+    this.stayPut = false;
+    this.stuck = 0;
+    const result = await this.skills.progress({ type: "tp", label: "传送" }, playerName, state);
+    if (generation !== this.planGeneration) return result.message ?? reply;
+    const message = result.message ?? reply;
     this.say(message, true);
     return message;
   }
@@ -560,6 +579,7 @@ function fallbackBlueprint(id: string, plan: Plan): MissionBlueprint {
   if (id === "follow") return { mode: "follow", title: "跟随", steps: [{ type: "follow" }] };
   if (id === "sit") return { mode: "sit", title: "坐下", steps: [{ type: "come" }, { type: "sit" }] };
   if (id === "sleep") return { mode: "sleep", title: "睡觉", steps: [{ type: "sleep", label: "睡觉" }] };
+  if (id === "tp" || id === "teleport") return { mode: "focused", title: "传送", steps: [{ type: "tp", label: "传送" }] };
   if (id === "attack" || id === "hunt") return { mode: "hunt", title: "进攻", steps: [{ type: "attack", entity: plan.entity, label: plan.entity }] };
   if (id === "stop") return { mode: "stop", title: "停下", steps: [{ type: "stop" }] };
   return plan.missions[plan.skill] ?? { mode: "idle", steps: [{ type: "follow" }] };

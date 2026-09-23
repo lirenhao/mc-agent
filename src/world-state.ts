@@ -1,13 +1,12 @@
 import type { Bot } from "mineflayer";
+import { isHostileEntity } from "./mobs.js";
 import type { Mission, WorldState } from "./types.js";
-
-const hostileNames = new Set(["zombie", "skeleton", "creeper", "spider", "enderman", "witch", "drowned", "husk"]);
 
 export function getWorldState(bot: Bot, childName?: string, mission?: Mission): WorldState {
   const position = bot.entity.position.floored();
   const child = childName ? bot.players[childName]?.entity : undefined;
   const hostiles = Object.values(bot.entities)
-    .filter((entity) => entity.type === "mob" && Boolean(entity.name) && hostileNames.has(entity.name!))
+    .filter((entity) => isHostileEntity(entity))
     .map((entity) => ({ name: entity.name!, distance: Number(entity.position.distanceTo(bot.entity.position).toFixed(1)) }))
     .filter((entity) => entity.distance < 20)
     .sort((a, b) => a.distance - b.distance)

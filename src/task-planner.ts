@@ -6,6 +6,7 @@ const templates: BuildTemplate[] = ["cabin", "farm", "camp"];
 const modes: MissionMode[] = ["focused", "follow", "guard", "idle", "stop", "sit", "hunt", "sleep"];
 
 export async function planMission(transcript: string, state: WorldState): Promise<Plan> {
+  if (/(传送|瞬移|\btp\b)/i.test(transcript)) return withDefaultMissions(localPlan(transcript));
   if (!config.llm.baseUrl || !config.llm.apiKey || !config.llm.model) {
     return withDefaultMissions(localPlan(transcript));
   }
@@ -22,9 +23,9 @@ export async function planMission(transcript: string, state: WorldState): Promis
             role: "system",
             content: `你是 Minecraft 陪玩 ${config.persona.name}。风格：${config.persona.style}。只输出一个 JSON 对象，不要 markdown。
 格式：{"reply":"不超过35字","mode":"focused|follow|guard|hunt|sit|sleep|stop|idle","title":"短标题","steps":[{"type":"collect","block":"oak_log","count":8,"label":"木头"}]}
-type 只能是：follow, stop, protect, collect, attack, build, place, give, come, look, dance, eat, goto, sit, sleep, wait。
+type 只能是：follow, stop, protect, collect, attack, build, place, give, come, look, dance, eat, goto, sit, sleep, tp, wait。
 mode：follow=一直跟着；guard=保护；hunt=一直进攻直到停下；sit=坐下陪着；sleep=上床睡觉直到天亮；stop=停下；focused=按 steps 做完再回来。
-孩子要睡觉或跳过夜晚时，type=sleep，mode=sleep。附近要有床；孩子也上床，夜晚才会过去。
+孩子要传送到身边时，type=tp，mode=focused。这会让机器人在游戏里发送 /tp，服务器必须允许它使用该命令。
 多件事拆成有序 steps。例如砍树盖房：collect oak_log → come → build，template 只能是 cabin、farm、camp。
 block/item 用英文 id（木头用 oak_log，石头用 stone，煤用 coal_ore，铁用 iron_ore，花用 dandelion）。
 攻击时 type=attack，mode=hunt，entity 用 zombie、skeleton、spider、creeper 等；没点名就省略 entity。不要攻击玩家或村民。
@@ -143,6 +144,7 @@ function stepsFromSkill(skill: string, root: Record<string, unknown>): ActionInt
   if (!id || id === "clarify") return [];
   if (id === "follow" || id === "stop" || id === "sit" || id === "protect") return [{ type: id }];
   if (id === "sleep") return [{ type: "sleep", label: "睡觉" }];
+  if (id === "tp" || id === "teleport") return [{ type: "tp", label: "传送" }];
   if (id === "status") return [{ type: "wait" }];
   if (id.includes("attack") || id.includes("hunt")) {
     const entity = typeof root.entity === "string" ? normalizeEntity(root.entity) : undefined;
@@ -225,6 +227,7 @@ const TYPE_ALIAS: Record<string, string> = {
   goto: "goto", 去: "goto",
   sit: "sit", rest: "sit", sneak: "sit", 坐下: "sit", 蹲下: "sit",
   sleep: "sleep", 睡觉: "sleep", 上床: "sleep", 过夜: "sleep",
+  tp: "tp", teleport: "tp", 传送: "tp", 瞬移: "tp",
   wait: "wait", 等: "wait",
   find: "find", 找: "find",
   explore: "explore", 探索: "explore",
@@ -294,6 +297,10 @@ function withDefaultMissions(task: ReturnType<typeof localPlan>): Plan {
     criteria.sleep = "孩子要上床睡觉，跳过夜晚。";
     missions.sleep = { mode: "sleep", title: "睡觉", steps: [{ type: "sleep", label: "睡觉" }] };
   }
+  if (task.skill === "tp") {
+    criteria.tp = "孩子要机器人用服务器的传送命令到自己身边。";
+    missions.tp = { mode: "focused", title: "传送", steps: [{ type: "tp", label: "传送" }] };
+  }
   if (task.skill === "attack") {
     criteria.attack = "孩子要主动进攻附近的生物。";
     missions.attack = {
@@ -339,6 +346,7 @@ function isTimeout(error: unknown): boolean {
 }
 
 function localPlan(text: string): Omit<Plan, "criteria" | "missions"> {
+  if (/(传送|瞬移|\btp\b)/i.test(text)) return { skill: "tp", reply: "好，我传送到你身边。" };
   if (/(睡觉|去睡|上床|跳过夜晚|睡到天亮|过夜)/.test(text)) return { skill: "sleep", reply: "好，我去床上睡觉。你也上床，我们就能到天亮。" };
   if (/(坐下|蹲下|坐着|坐下来|休息一下)/.test(text)) return { skill: "sit", reply: "好，我坐下来陪你。" };
   if (/(停|别动|停止)/.test(text)) return { skill: "stop", reply: "好，我停在这里等你。" };

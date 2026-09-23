@@ -2,6 +2,7 @@ import type { Bot } from "mineflayer";
 import "mineflayer-collectblock";
 import pathfinderModule from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
+import { isHostileEntity } from "./mobs.js";
 import type { ActionIntent, StepResult, WorldState } from "./types.js";
 
 const { goals, Movements } = pathfinderModule;
@@ -93,7 +94,7 @@ export class Skills {
   threatNear(position: Vec3, radius: number): { name: string; distance: number } | undefined {
     let closest: { name: string; distance: number } | undefined;
     for (const entity of Object.values(this.bot.entities)) {
-      if (entity.type !== "mob" || !entity.name || !this.isHostile(entity.name)) continue;
+      if (!isHostileEntity(entity)) continue;
       const distance = entity.position.distanceTo(position);
       if (distance > radius) continue;
       if (!closest || distance < closest.distance) closest = { name: entity.name, distance };
@@ -178,6 +179,7 @@ export class Skills {
     if (type === "look") return this.look(playerName);
     if (type === "sit" || type === "sneak" || type === "rest") return this.sit(playerName);
     if (type === "sleep") return this.sleepNight();
+    if (type === "tp" || type === "teleport") return this.teleportTo(playerName);
     if (intent.block || intent.item) return this.collectOne({ ...intent, type: "collect" });
     if (intent.entity) return this.attack(intent);
     return this.explore();
@@ -256,7 +258,7 @@ export class Skills {
       if (candidate.type === "player" || neverAttack.has(candidate.name)) return false;
       if (candidate.position.distanceTo(this.bot.entity.position) > 24) return false;
       if (targetName) return candidate.name === targetName || candidate.name.includes(targetName);
-      return candidate.type === "mob" && this.isHostile(candidate.name);
+      return isHostileEntity(candidate);
     });
     if (!entity) return { status: "done", message: intent.entity ? `附近没有${intent.label ?? intent.entity}了。` : "附近暂时没有要打的。" };
     if (entity.name === "creeper") {
@@ -411,6 +413,24 @@ export class Skills {
     });
   }
 
+  private teleportTo(playerName: string): StepResult {
+    const target = this.teleportTarget(playerName);
+    if (!target) return { status: "blocked", message: "这个名字不能写进传送命令。" };
+    this.stop();
+    const command = `/tp ${target}`;
+    console.log(`发送传送命令 ${command}`);
+    this.bot.chat(command);
+    return { status: "done", message: `我传送过去了。要是没到身边，请先开作弊，再输入 /op ${this.bot.username}。` };
+  }
+
+  private teleportTarget(playerName: string): string | undefined {
+    const named = playerName.trim();
+    if (!named) return undefined;
+    const online = Object.keys(this.bot.players).find((name) => name.toLowerCase() === named.toLowerCase());
+    const target = online ?? named;
+    return /^[\p{L}\p{N}_]{1,16}$/u.test(target) ? target : undefined;
+  }
+
   private sit(playerName: string): StepResult {
     const player = this.bot.players[playerName];
     if (player?.entity && player.entity.position.distanceTo(this.bot.entity.position) > 3.5) return this.come(playerName);
@@ -463,12 +483,8 @@ export class Skills {
     this.bot.pathfinder.setGoal(new goals.GoalNear(ahead.x, ahead.y, ahead.z, 2));
   }
 
-  private isHostile(name: string): boolean {
-    return ["zombie", "skeleton", "spider", "witch", "drowned", "husk", "creeper", "slime", "enderman"].includes(name);
-  }
-
   private nearestHostile() {
-    return this.bot.nearestEntity((entity) => entity.type === "mob" && Boolean(entity.name) && this.isHostile(entity.name!) && entity.position.distanceTo(this.bot.entity.position) < 14);
+    return this.bot.nearestEntity((entity) => isHostileEntity(entity) && entity.position.distanceTo(this.bot.entity.position) < 14);
   }
 }
 
