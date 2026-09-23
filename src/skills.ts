@@ -2,6 +2,7 @@ import type { Bot } from "mineflayer";
 import "mineflayer-collectblock";
 import pathfinderModule from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
+import { ChildDrops, DROP_CLAIM_RADIUS, DROP_GIVE_UP_MS } from "./drops.js";
 import { isHostileEntity } from "./mobs.js";
 import type { ActionIntent, StepResult, WorldState } from "./types.js";
 
@@ -38,8 +39,69 @@ const neverAttack = new Set(["player", "villager", "wandering_trader", "iron_gol
 
 export class Skills {
   private buildCursor?: { origin: Vec3; index: number; plan: Array<{ dx: number; dy: number; dz: number; names: string[] }> };
+  private readonly drops = new ChildDrops();
+  private watchingDrops = false;
 
   constructor(private readonly bot: Bot) {}
+
+  watchChildDrops(childName: () => string): void {
+    if (this.watchingDrops) return;
+    this.watchingDrops = true;
+    this.bot.on("entitySpawn", (entity) => {
+      const child = this.bot.players[childName()]?.entity;
+      this.drops.notice(entity, child?.position);
+    });
+    this.bot.on("entityGone", (entity) => this.drops.forget(entity.id));
+    this.bot.on("playerCollect", (_collector, collected) => {
+      if (collected) this.drops.forget(collected.id);
+    });
+  }
+
+  ignoreOwnDrops(ms = 2_000): void {
+    this.drops.ignore(ms);
+  }
+
+  claimNearbyDrops(playerName: string, radius = DROP_CLAIM_RADIUS): number {
+    return this.drops.claim(this.dropWorld(), playerName, radius);
+  }
+
+  hasChildDrop(playerName: string): boolean {
+    return this.drops.has(this.dropWorld(), playerName);
+  }
+
+  pickupChildDrop(playerName: string): StepResult {
+    const world = this.dropWorld();
+    const drop = this.drops.next(world, playerName);
+    if (!drop) return { status: "done" };
+    if (!this.canHoldDrop(drop)) return { status: "blocked", message: "我背包满了，捡不了。" };
+    const here = this.bot.entity.position;
+    const distance = Math.hypot(drop.position.x - here.x, drop.position.y - here.y, drop.position.z - here.z);
+    if (distance > 2.5 && this.drops.attemptAge(drop.id) > DROP_GIVE_UP_MS) {
+      this.drops.forget(drop.id);
+      if (!this.drops.has(world, playerName)) return { status: "blocked", message: "我过不去那个东西。" };
+      return { status: "progress" };
+    }
+    this.bot.setControlState("sneak", false);
+    this.bot.pathfinder.setMovements(new Movements(this.bot));
+    this.bot.pathfinder.setGoal(new goals.GoalNear(drop.position.x, drop.position.y, drop.position.z, 1), true);
+    return { status: "progress" };
+  }
+
+  private dropWorld() {
+    return { entity: this.bot.entity, entities: this.bot.entities, players: this.bot.players };
+  }
+
+  private canHoldDrop(entity: { getDroppedItem?: () => { type?: number; stackSize?: number } | null }): boolean {
+    if (this.bot.inventory.emptySlotCount() > 0) return true;
+    let dropped: { type?: number; stackSize?: number } | null = null;
+    try {
+      dropped = entity.getDroppedItem?.() ?? null;
+    } catch {
+      dropped = null;
+    }
+    if (!dropped?.type) return false;
+    return this.bot.inventory.items().some((slot) => slot.type === dropped.type && slot.count < (slot.stackSize ?? dropped.stackSize ?? 64));
+  }
 
   stop(): void {
     if (this.bot.isSleeping) void this.bot.wake().catch(() => undefined);
@@ -330,6 +392,7 @@ export class Skills {
     if (!item) return { status: "blocked", message: `我背包里没有${intent.label ?? intent.item ?? "能送你的东西"}。` };
     try {
       await this.bot.lookAt(player.entity.position.offset(0, 1.2, 0));
+      this.ignoreOwnDrops();
       await this.bot.toss(item.type, null, Math.min(intent.count ?? 1, item.count));
       return { status: "done", message: `给你${intent.label ?? item.name}。` };
     } catch (error) {

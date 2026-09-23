@@ -46,6 +46,11 @@ export class Companion {
   private noUseful = false;
   private assist: Assist = { kind: "follow" };
   private childOverride = "";
+  private gathering = false;
+  private pickupRequested = false;
+  private pickupSince = 0;
+  private dropRetryAt = 0;
+  private sawDrop = false;
   private recent: RecentAction[] = [];
   private readonly cooled = new Map<string, number>();
   private timer?: NodeJS.Timeout;
@@ -58,6 +63,7 @@ export class Companion {
 
   start(): void {
     this.partner.bind(this.bot, this.childName());
+    this.skills.watchChildDrops(() => this.childName());
     this.timer = setInterval(() => void this.tick(), TICK_MS);
   }
 
@@ -106,6 +112,9 @@ export class Companion {
     this.busy = false;
     this.deciding = false;
     this.failures = 0;
+    this.gathering = false;
+    this.pickupRequested = false;
+    this.sawDrop = false;
   }
 
   private childName(): string {
@@ -143,6 +152,7 @@ export class Companion {
     const plan = await planMission(text, state);
     if (generation !== this.planGeneration) return plan.reply;
     if (plan.skill === "tp") return this.teleportNow(playerName, state, generation, plan.reply);
+    if (plan.skill === "pickup") return this.pickupNow(playerName, generation);
     const chosen = await chooseMission(plan, state);
     if (generation !== this.planGeneration) return plan.reply;
     this.skills.stop();
@@ -184,6 +194,81 @@ export class Companion {
     return message;
   }
 
+  private pickupNow(playerName: string, generation: number): string {
+    this.skills.stop();
+    this.mission = undefined;
+    this.holding = undefined;
+    this.stayPut = false;
+    this.stuck = 0;
+    if (generation !== this.planGeneration) return "好，我去捡你掉的东西。";
+    const child = this.bot.players[playerName]?.entity;
+    this.skills.claimNearbyDrops(playerName);
+    const hasDrop = this.skills.hasChildDrop(playerName);
+    const nearby = Boolean(child && child.position.distanceTo(this.bot.entity.position) <= 6);
+    const message = !child && !hasDrop
+      ? "我现在看不到你，靠近一点再让我捡。"
+      : nearby && !hasDrop
+        ? "你身边没有掉落的东西。"
+        : "好，我去捡你掉的东西。";
+    if (message.startsWith("好")) {
+      this.pickupRequested = true;
+      this.gathering = true;
+      this.sawDrop = hasDrop;
+      this.pickupSince = Date.now();
+    }
+    this.say(message, true);
+    return message;
+  }
+
+  private gatherDrops(playerName: string): boolean {
+    if (!this.pickupRequested && Date.now() < this.dropRetryAt) return false;
+    if (this.pickupRequested) this.skills.claimNearbyDrops(playerName);
+    const hasDrop = this.skills.hasChildDrop(playerName);
+    if (hasDrop) this.sawDrop = true;
+    if (!this.pickupRequested && !this.gathering && (!hasDrop || !this.canAutoPickup())) return false;
+    if (!hasDrop) {
+      if (this.pickupRequested && !this.sawDrop && this.shouldSearchDrops(playerName)) {
+        this.skills.keepFollow(playerName, 2);
+        return true;
+      }
+      const message = this.sawDrop ? "我捡到了。" : this.pickupRequested ? "你身边没有掉落的东西。" : "";
+      this.finishPickup(message);
+      return false;
+    }
+    if (!this.pickupRequested && !this.canAutoPickup()) return false;
+    if (!this.gathering) {
+      this.gathering = true;
+      this.say("我去捡你掉的东西。", true);
+    }
+    const result = this.skills.pickupChildDrop(playerName);
+    if (result.status === "blocked") {
+      this.dropRetryAt = Date.now() + 15_000;
+      this.finishPickup(result.message ?? "我现在捡不了。");
+    }
+    return true;
+  }
+
+  private canAutoPickup(): boolean {
+    if (!this.mission) return true;
+    return this.mission.mode === "follow" || this.mission.mode === "idle" || this.mission.mode === "sit";
+  }
+
+  private shouldSearchDrops(playerName: string): boolean {
+    if (Date.now() - this.pickupSince > 20_000) return false;
+    const child = this.bot.players[playerName]?.entity;
+    if (!child) return false;
+    return child.position.distanceTo(this.bot.entity.position) > 6;
+  }
+
+  private finishPickup(message: string): void {
+    const wasGathering = this.gathering;
+    this.gathering = false;
+    this.pickupRequested = false;
+    this.sawDrop = false;
+    this.skills.stop();
+    if (message && wasGathering) this.say(message, true);
+  }
+
   private createMission(id: string, reply: string, blueprint: MissionBlueprint): Mission {
     const now = Date.now();
     const first = blueprint.steps[0];
@@ -212,6 +297,7 @@ export class Companion {
     this.queueBackgroundPlan(state);
     if (this.busy) return;
     if (await this.maybeEat()) return;
+    if (this.gatherDrops(playerName)) return;
 
     if (this.mission && Date.now() - this.mission.startedAt > MISSION_LIMIT_MS) {
       this.say("这件事变久了，我先回到你身边。", true);

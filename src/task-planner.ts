@@ -5,8 +5,13 @@ const resources: ResourceName[] = ["wood", "stone", "coal", "iron"];
 const templates: BuildTemplate[] = ["cabin", "farm", "camp"];
 const modes: MissionMode[] = ["focused", "follow", "guard", "idle", "stop", "sit", "hunt", "sleep"];
 
+export function isPickupRequest(text: string): boolean {
+  return /(捡起|捡起来|捡东西|捡我的|帮我捡|拣起|拣起来|拣取|拣东西|拣物资|捡物资|把地上)/.test(text);
+}
+
 export async function planMission(transcript: string, state: WorldState): Promise<Plan> {
   if (/(传送|瞬移|\btp\b)/i.test(transcript)) return withDefaultMissions(localPlan(transcript));
+  if (isPickupRequest(transcript)) return withDefaultMissions(localPlan(transcript));
   if (!config.llm.baseUrl || !config.llm.apiKey || !config.llm.model) {
     return withDefaultMissions(localPlan(transcript));
   }
@@ -351,6 +356,7 @@ function localPlan(text: string): Omit<Plan, "criteria" | "missions"> {
   if (/(坐下|蹲下|坐着|坐下来|休息一下)/.test(text)) return { skill: "sit", reply: "好，我坐下来陪你。" };
   if (/(停|别动|停止)/.test(text)) return { skill: "stop", reply: "好，我停在这里等你。" };
   if (/(跟着|跟我|跟随)/.test(text)) return { skill: "follow", reply: "好，我跟着你。" };
+  if (isPickupRequest(text)) return { skill: "pickup", reply: "好，我去捡你掉的东西。" };
   const target = parseMob(text);
   if (/(攻击|进攻|开战|去打|打它|打怪|砍怪|打一打)/.test(text) || /打(僵尸|骷髅|蜘蛛|苦力怕|末影人|女巫|史莱姆|溺尸|猪|牛|羊|鸡)/.test(text)) {
     return {
