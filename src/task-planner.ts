@@ -33,7 +33,7 @@ export async function planMission(transcript: string, state: WorldState): Promis
 type 只能是：follow, stop, protect, collect, attack, build, place, give, come, look, dance, eat, goto, sit, sleep, tp, craft, wait。
 mode：follow=一直跟着；guard=保护；hunt=一直进攻直到停下；sit=坐下陪着；sleep=上床睡觉直到天亮；stop=停下；focused=按 steps 做完再回来。
 孩子要传送到身边时，type=tp，mode=focused。这会让机器人在游戏里发送 /tp，服务器必须允许它使用该命令。
-孩子要做东西时，type=craft，item 用英文 id（木板 oak_planks，木棍 stick，工作台 crafting_table，木镐 wooden_pickaxe，箱子 chest，火把 torch）。需要工作台的物品，机器人会自己找到或放下一张工作台再制作。
+孩子要做东西时，type=craft，item 用英文 id（木板 oak_planks，木棍 stick，木镐 wooden_pickaxe，箱子 chest，火把 torch）。只使用附近已经放好的工作台，不要制作或放置工作台。没有工作台就说明做不了。孩子只说用工作台时，item=use_table。
 多件事拆成有序 steps。例如砍树盖房：collect oak_log → come → build，template 只能是 cabin、farm、camp。
 block/item 用英文 id（木头用 oak_log，石头用 stone，煤用 coal_ore，铁用 iron_ore，花用 dandelion）。
 攻击时 type=attack，mode=hunt，entity 用 zombie、skeleton、spider、creeper 等；没点名就省略 entity。不要攻击玩家或村民。
@@ -317,7 +317,7 @@ function withDefaultMissions(task: ReturnType<typeof localPlan>): Plan {
     missions.tp = { mode: "focused", title: "传送", steps: [{ type: "tp", label: "传送" }] };
   }
   if (task.skill === "craft" && task.item) {
-    criteria.craft = "孩子要机器人自己用工作台或背包把材料做成东西。";
+    criteria.craft = "孩子要机器人使用附近已有的工作台来做东西，不要制作工作台。";
     missions.craft = {
       mode: "focused",
       title: craftLabel(task.item),
@@ -376,6 +376,7 @@ function localPlan(text: string): Omit<Plan, "criteria" | "missions"> {
   if (/(跟着|跟我|跟随)/.test(text)) return { skill: "follow", reply: "好，我跟着你。" };
   if (isPickupRequest(text)) return { skill: "pickup", reply: "好，我去捡你掉的东西。" };
   const craft = parseCraftRequest(text);
+  if (craft?.item === "use_table") return { skill: "craft", item: "use_table", reply: "好，我去用旁边的工作台。" };
   if (craft) return { skill: "craft", item: craft.item, reply: `好，我去做${craft.label}。` };
   const target = parseMob(text);
   if (/(攻击|进攻|开战|去打|打它|打怪|砍怪|打一打)/.test(text) || /打(僵尸|骷髅|蜘蛛|苦力怕|末影人|女巫|史莱姆|溺尸|猪|牛|羊|鸡)/.test(text)) {

@@ -1,7 +1,7 @@
 export type CraftAction =
   | { kind: "craft"; item: string; label: string; needsTable: boolean }
-  | { kind: "place-table" }
-  | { kind: "done"; label: string }
+  | { kind: "use-table" }
+  | { kind: "need-table" }
   | { kind: "missing"; label: string };
 
 type Ingredient = { item: string; count: number };
@@ -20,7 +20,6 @@ const PLANKS = ["oak_planks", "birch_planks", "spruce_planks", "jungle_planks", 
 const CRAFTS: CraftSpec[] = [
   { item: "oak_planks", label: "木板", needsTable: false, ingredients: [{ item: "oak_log", count: 1 }], aliases: /木板/ },
   { item: "stick", label: "木棍", needsTable: false, ingredients: [{ item: "planks", count: 2 }], aliases: /木棍|棍子/ },
-  { item: "crafting_table", label: "工作台", needsTable: false, ingredients: [{ item: "planks", count: 4 }], aliases: /工作台|合成台/ },
   { item: "chest", label: "箱子", needsTable: true, ingredients: [{ item: "planks", count: 8 }], aliases: /箱子/ },
   { item: "wooden_pickaxe", label: "木镐", needsTable: true, ingredients: [{ item: "planks", count: 3 }, { item: "stick", count: 2 }], aliases: /木镐/ },
   { item: "wooden_axe", label: "木斧", needsTable: true, ingredients: [{ item: "planks", count: 3 }, { item: "stick", count: 2 }], aliases: /木斧/ },
@@ -43,13 +42,14 @@ const GROUP_LABEL: Record<string, string> = {
 
 export function parseCraftRequest(text: string): { item: string; label: string } | undefined {
   if (!/(做|合成|制作|打造|工作台|合成台)/.test(text)) return undefined;
-  const specific = CRAFTS.find((spec) => spec.item !== "crafting_table" && spec.aliases.test(text));
+  const specific = CRAFTS.find((spec) => spec.aliases.test(text));
   if (specific) return { item: specific.item, label: specific.label };
-  if (/(工作台|合成台)/.test(text)) return { item: "crafting_table", label: "工作台" };
+  if (/(工作台|合成台)/.test(text)) return { item: "use_table", label: "工作台" };
   return undefined;
 }
 
 export function craftLabel(item: string): string {
+  if (item === "use_table" || item === "crafting_table") return "工作台";
   return specFor(item)?.label ?? item;
 }
 
@@ -63,29 +63,25 @@ export function craftItemId(name: string): string | undefined {
 }
 
 export function isCraftItem(item: string): boolean {
-  return Boolean(specFor(item));
+  return item === "use_table" || item === "crafting_table" || Boolean(specFor(item));
 }
 
 export function nextCraftAction(options: {
   item: string;
   have: Record<string, number>;
   tableNearby: boolean;
-  holdingTable: boolean;
 }): CraftAction {
+  if (options.item === "use_table" || options.item === "crafting_table") {
+    return options.tableNearby ? { kind: "use-table" } : { kind: "need-table" };
+  }
   return plan(options.item, options, 0);
 }
 
-function plan(item: string, options: { item: string; have: Record<string, number>; tableNearby: boolean; holdingTable: boolean }, depth: number): CraftAction {
+function plan(item: string, options: { item: string; have: Record<string, number>; tableNearby: boolean }, depth: number): CraftAction {
   if (depth > 6) return { kind: "missing", label: "材料" };
   const spec = specFor(item);
   if (!spec) return { kind: "missing", label: GROUP_LABEL[item] ?? "材料" };
-  if (options.item === "crafting_table" && item === "crafting_table" && options.tableNearby) {
-    return { kind: "done", label: "工作台" };
-  }
-  if (spec.needsTable && !options.tableNearby) {
-    if (options.holdingTable) return { kind: "place-table" };
-    if (item !== "crafting_table") return plan("crafting_table", options, depth + 1);
-  }
+  if (spec.needsTable && !options.tableNearby) return { kind: "need-table" };
   for (const ingredient of spec.ingredients) {
     if (ingredient.item === "planks") {
       if (largest(PLANKS, options.have) >= ingredient.count) continue;

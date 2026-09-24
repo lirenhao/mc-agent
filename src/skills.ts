@@ -490,11 +490,10 @@ export class Skills {
       item,
       have,
       tableNearby: Boolean(table),
-      holdingTable: (have.crafting_table ?? 0) > 0,
     });
-    if (action.kind === "done") return { status: "done", message: "工作台就在旁边，我可以用它。" };
+    if (action.kind === "need-table") return { status: "blocked", message: "附近没有工作台，我没法用。" };
+    if (action.kind === "use-table") return this.useCraftingTable(table);
     if (action.kind === "missing") return { status: "blocked", message: `还缺${action.label}，我做不了。` };
-    if (action.kind === "place-table") return this.placeCraftingTable();
     if (action.needsTable) {
       if (!table) return { status: "blocked", message: "我找不到工作台。" };
       if (table.position.distanceTo(this.bot.entity.position) > 3) {
@@ -543,17 +542,21 @@ export class Skills {
     });
   }
 
-  private async placeCraftingTable(): Promise<StepResult> {
-    const origin = this.bot.entity.position.floored();
-    const spots = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [2, 0, 0], [0, 0, 2], [1, 0, 1], [-1, 0, 1]];
-    for (const [x, , z] of spots) {
-      const target = origin.offset(x, 0, z);
-      const ground = this.bot.blockAt(target.offset(0, -1, 0));
-      const above = this.bot.blockAt(target);
-      if (!above || above.name !== "air" || !ground || ground.name === "air" || /water|lava/.test(ground.name)) continue;
-      if (await this.placeAt(target, ["crafting_table"])) return { status: "progress", message: "我把工作台放好了。" };
+  private async useCraftingTable(table: Block | null): Promise<StepResult> {
+    if (!table) return { status: "blocked", message: "附近没有工作台，我没法用。" };
+    if (table.position.distanceTo(this.bot.entity.position) > 3) {
+      this.bot.pathfinder.setMovements(new Movements(this.bot));
+      this.bot.pathfinder.setGoal(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+      return { status: "progress", message: "我去工作台那里。" };
     }
-    return { status: "blocked", message: "旁边没空地放工作台。" };
+    this.bot.pathfinder.setGoal(null);
+    try {
+      await this.bot.activateBlock(table);
+    } catch (error) {
+      console.warn("打开工作台失败：", error);
+      return { status: "blocked", message: "我打不开这张工作台。" };
+    }
+    return { status: "done", message: "我打开工作台了。要做木镐、箱子还是木门？" };
   }
 
   private inventoryCounts(): Record<string, number> {

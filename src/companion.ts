@@ -50,7 +50,6 @@ export class Companion {
   private gathering = false;
   private pickupRequested = false;
   private pickupSince = 0;
-  private dropRetryAt = 0;
   private sawDrop = false;
   private recent: RecentAction[] = [];
   private readonly cooled = new Map<string, number>();
@@ -222,36 +221,21 @@ export class Companion {
   }
 
   private gatherDrops(playerName: string): boolean {
-    if (!this.pickupRequested && Date.now() < this.dropRetryAt) return false;
-    if (this.pickupRequested) this.skills.claimNearbyDrops(playerName);
+    if (!this.pickupRequested) return false;
+    this.skills.claimNearbyDrops(playerName);
     const hasDrop = this.skills.hasChildDrop(playerName);
     if (hasDrop) this.sawDrop = true;
-    if (!this.pickupRequested && !this.gathering && (!hasDrop || !this.canAutoPickup())) return false;
     if (!hasDrop) {
-      if (this.pickupRequested && !this.sawDrop && this.shouldSearchDrops(playerName)) {
+      if (!this.sawDrop && this.shouldSearchDrops(playerName)) {
         this.skills.keepFollow(playerName, 2);
         return true;
       }
-      const message = this.sawDrop ? "我捡到了。" : this.pickupRequested ? "你身边没有掉落的东西。" : "";
-      this.finishPickup(message);
+      this.finishPickup(this.sawDrop ? "我捡到了。" : "你身边没有掉落的东西。");
       return false;
     }
-    if (!this.pickupRequested && !this.canAutoPickup()) return false;
-    if (!this.gathering) {
-      this.gathering = true;
-      this.say("我去捡你掉的东西。", true);
-    }
     const result = this.skills.pickupChildDrop(playerName);
-    if (result.status === "blocked") {
-      this.dropRetryAt = Date.now() + 15_000;
-      this.finishPickup(result.message ?? "我现在捡不了。");
-    }
+    if (result.status === "blocked") this.finishPickup(result.message ?? "我现在捡不了。");
     return true;
-  }
-
-  private canAutoPickup(): boolean {
-    if (!this.mission) return true;
-    return this.mission.mode === "follow" || this.mission.mode === "idle" || this.mission.mode === "sit";
   }
 
   private shouldSearchDrops(playerName: string): boolean {
