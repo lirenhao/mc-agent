@@ -1,5 +1,7 @@
 import { config } from "./config.js";
 import { craftItemId, craftLabel, parseCraftRequest } from "./craft.js";
+import { parseGameMode } from "./gamemode.js";
+import { parseStorageRequest, storageLabel } from "./storage.js";
 import { DEFAULT_CRITERIA, SKILL_NAMES, type ActionIntent, type BuildTemplate, type MissionBlueprint, type MissionMode, type Plan, type ResourceName, type SkillName, type WorldState } from "./types.js";
 
 const resources: ResourceName[] = ["wood", "stone", "coal", "iron"];
@@ -12,7 +14,9 @@ export function isPickupRequest(text: string): boolean {
 
 export async function planMission(transcript: string, state: WorldState): Promise<Plan> {
   if (/(传送|瞬移|\btp\b)/i.test(transcript)) return withDefaultMissions(localPlan(transcript));
+  if (parseGameMode(transcript)) return withDefaultMissions(localPlan(transcript));
   if (isPickupRequest(transcript)) return withDefaultMissions(localPlan(transcript));
+  if (parseStorageRequest(transcript)) return withDefaultMissions(localPlan(transcript));
   if (parseCraftRequest(transcript)) return withDefaultMissions(localPlan(transcript));
   if (!config.llm.baseUrl || !config.llm.apiKey || !config.llm.model) {
     return withDefaultMissions(localPlan(transcript));
@@ -33,6 +37,7 @@ export async function planMission(transcript: string, state: WorldState): Promis
 type 只能是：follow, stop, protect, collect, attack, build, place, give, come, look, dance, eat, goto, sit, sleep, tp, craft, wait。
 mode：follow=一直跟着；guard=保护；hunt=一直进攻直到停下；sit=坐下陪着；sleep=上床睡觉直到天亮；stop=停下；focused=按 steps 做完再回来。
 孩子要传送到身边时，type=tp，mode=focused。这会让机器人在游戏里发送 /tp，服务器必须允许它使用该命令。
+孩子要存东西或拿东西时，type=deposit 表示放进附近的箱子，type=withdraw 表示从箱子拿出。item 可省略，省略就是全部。不要把「放进箱子」理解成制作箱子。
 孩子要做东西时，type=craft，item 用英文 id（木板 oak_planks，木棍 stick，木镐 wooden_pickaxe，箱子 chest，火把 torch）。只使用附近已经放好的工作台，不要制作或放置工作台。没有工作台就说明做不了。孩子只说用工作台时，item=use_table。
 多件事拆成有序 steps。例如砍树盖房：collect oak_log → come → build，template 只能是 cabin、farm、camp。
 block/item 用英文 id（木头用 oak_log，石头用 stone，煤用 coal_ore，铁用 iron_ore，花用 dandelion）。
@@ -316,6 +321,15 @@ function withDefaultMissions(task: ReturnType<typeof localPlan>): Plan {
     criteria.tp = "孩子要机器人用服务器的传送命令到自己身边。";
     missions.tp = { mode: "focused", title: "传送", steps: [{ type: "tp", label: "传送" }] };
   }
+  if (task.skill === "store" && task.store) {
+    const title = task.store === "deposit" ? "放进箱子" : "从箱子拿";
+    criteria.store = "孩子要机器人把背包放进附近的箱子，或从箱子里拿东西。";
+    missions.store = {
+      mode: "focused",
+      title,
+      steps: [{ type: task.store, item: task.item, label: storageLabel(task.store, task.item) }],
+    };
+  }
   if (task.skill === "craft" && task.item) {
     criteria.craft = "孩子要机器人使用附近已有的工作台来做东西，不要制作工作台。";
     missions.craft = {
@@ -370,11 +384,19 @@ function isTimeout(error: unknown): boolean {
 
 function localPlan(text: string): Omit<Plan, "criteria" | "missions"> {
   if (/(传送|瞬移|\btp\b)/i.test(text)) return { skill: "tp", reply: "好，我传送到你身边。" };
+  const gameMode = parseGameMode(text);
+  if (gameMode === "ask") return { skill: "clarify", reply: "可以说生存、创造、冒险或旁观。说「切换创造」改我的，说「把我改成创造」改你的。" };
+  if (gameMode) return { skill: "gamemode", item: gameMode.mode, entity: gameMode.target, reply: gameMode.target === "child" ? `好，我把你改成${gameMode.label}模式。` : `好，我切换到${gameMode.label}模式。` };
   if (/(睡觉|去睡|上床|跳过夜晚|睡到天亮|过夜)/.test(text)) return { skill: "sleep", reply: "好，我去床上睡觉。你也上床，我们就能到天亮。" };
   if (/(坐下|蹲下|坐着|坐下来|休息一下)/.test(text)) return { skill: "sit", reply: "好，我坐下来陪你。" };
   if (/(停|别动|停止)/.test(text)) return { skill: "stop", reply: "好，我停在这里等你。" };
   if (/(跟着|跟我|跟随)/.test(text)) return { skill: "follow", reply: "好，我跟着你。" };
   if (isPickupRequest(text)) return { skill: "pickup", reply: "好，我去捡你掉的东西。" };
+  const storage = parseStorageRequest(text);
+  if (storage) {
+    const reply = storage.mode === "deposit" ? `好，我把${storage.label}放进箱子。` : `好，我去箱子里拿${storage.label}。`;
+    return { skill: "store", store: storage.mode, item: storage.item, reply };
+  }
   const craft = parseCraftRequest(text);
   if (craft?.item === "use_table") return { skill: "craft", item: "use_table", reply: "好，我去用旁边的工作台。" };
   if (craft) return { skill: "craft", item: craft.item, reply: `好，我去做${craft.label}。` };

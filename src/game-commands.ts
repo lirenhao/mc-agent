@@ -1,5 +1,5 @@
 const COMMAND_PREFIX = /^[!！]\s*bot\s*/i;
-const DIRECT_ORDER = /^(跟着我|跟我|跟随|坐下|蹲下|坐下来|坐着|睡觉|去睡觉|上床|跳过夜晚|睡到天亮|过夜|传送|瞬移|tp|捡起来|捡东西|捡我的|拣起来|拣东西|做|合成|制作|工作台|攻击|进攻|去打|打怪|保护我|救我|停下|别动|停止|状态|砍|挖|采|摘|给|盖|建造)/;
+const DIRECT_ORDER = /^(跟着我|跟我|跟随|坐下|蹲下|坐下来|坐着|睡觉|去睡觉|上床|跳过夜晚|睡到天亮|过夜|传送|瞬移|tp|捡起来|捡东西|捡我的|拣起来|拣东西|放进箱子|放到箱子|放入箱子|存进箱子|从箱子|切换|创造|生存|冒险|旁观|做|合成|制作|工作台|攻击|进攻|去打|打怪|保护我|救我|停下|别动|停止|状态|砍|挖|采|摘|给|盖|建造)/;
 
 export function parseGameCommand(raw: string, options: { persona?: string; direct?: boolean } = {}): string | undefined {
   let message = raw.replace(/\u00a7./g, "").trim();

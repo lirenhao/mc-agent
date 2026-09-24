@@ -152,6 +152,7 @@ export class Companion {
     const plan = await planMission(text, state);
     if (generation !== this.planGeneration) return plan.reply;
     if (plan.skill === "tp") return this.teleportNow(playerName, state, generation, plan.reply);
+    if (plan.skill === "gamemode") return this.changeModeNow(playerName, plan, generation);
     if (plan.skill === "pickup") return this.pickupNow(playerName, generation);
     const chosen = await chooseMission(plan, state);
     if (generation !== this.planGeneration) return plan.reply;
@@ -190,6 +191,18 @@ export class Companion {
     const result = await this.skills.progress({ type: "tp", label: "传送" }, playerName, state);
     if (generation !== this.planGeneration) return result.message ?? reply;
     const message = result.message ?? reply;
+    this.say(message, true);
+    return message;
+  }
+
+  private changeModeNow(playerName: string, plan: Plan, generation: number): string {
+    this.skills.stop();
+    this.mission = undefined;
+    this.holding = undefined;
+    this.stayPut = false;
+    if (generation !== this.planGeneration) return plan.reply;
+    const result = this.skills.changeGameMode(plan.item ?? "", playerName, plan.entity === "child");
+    const message = result.message ?? plan.reply;
     this.say(message, true);
     return message;
   }
@@ -528,12 +541,12 @@ export class Companion {
       this.trackProgress();
       this.noteResult(key, result, quiet);
       if (this.sticky(offer) || !this.mission) return;
-      if (offer.intent.type.toLowerCase() === "sleep" || offer.intent.type.toLowerCase() === "craft") {
+      if (offer.intent.type.toLowerCase() === "sleep" || offer.intent.type.toLowerCase() === "craft" || offer.intent.type.toLowerCase() === "deposit" || offer.intent.type.toLowerCase() === "withdraw") {
         if (result.status === "done") this.nextStep(playerName, state);
         if (result.status === "blocked") {
           this.holding = undefined;
           this.nextDecisionAt = 0;
-          if (offer.intent.type.toLowerCase() === "craft") {
+          if (offer.intent.type.toLowerCase() !== "sleep") {
             this.mission = undefined;
             this.skills.keepFollow(playerName, 3);
           }
@@ -656,6 +669,7 @@ function fallbackBlueprint(id: string, plan: Plan): MissionBlueprint {
   if (id === "sleep") return { mode: "sleep", title: "睡觉", steps: [{ type: "sleep", label: "睡觉" }] };
   if (id === "tp" || id === "teleport") return { mode: "focused", title: "传送", steps: [{ type: "tp", label: "传送" }] };
   if (id === "craft") return { mode: "focused", title: plan.item ? craftLabel(plan.item) : "制作", steps: [{ type: "craft", item: plan.item, label: plan.item ? craftLabel(plan.item) : "制作" }] };
+  if (id === "store" && plan.store) return { mode: "focused", title: plan.store === "deposit" ? "放进箱子" : "从箱子拿", steps: [{ type: plan.store, item: plan.item }] };
   if (id === "attack" || id === "hunt") return { mode: "hunt", title: "进攻", steps: [{ type: "attack", entity: plan.entity, label: plan.entity }] };
   if (id === "stop") return { mode: "stop", title: "停下", steps: [{ type: "stop" }] };
   return plan.missions[plan.skill] ?? { mode: "idle", steps: [{ type: "follow" }] };

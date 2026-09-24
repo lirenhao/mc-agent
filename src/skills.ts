@@ -1,9 +1,12 @@
+import type { Chest } from "mineflayer";
 import type { Block } from "prismarine-block";
 import type { Bot } from "mineflayer";
 import "mineflayer-collectblock";
 import pathfinderModule from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { isCraftItem, nextCraftAction } from "./craft.js";
+import { storageNames } from "./storage.js";
+import { chooseHarvestTool } from "./tools.js";
 import { ChildDrops, DROP_CLAIM_RADIUS, DROP_GIVE_UP_MS } from "./drops.js";
 import { isHostileEntity } from "./mobs.js";
 import type { ActionIntent, StepResult, WorldState } from "./types.js";
@@ -108,7 +111,7 @@ export class Skills {
   stop(): void {
     if (this.bot.isSleeping) void this.bot.wake().catch(() => undefined);
     const opened = this.bot.currentWindow;
-    if (opened && /crafting/i.test(String(opened.type))) void this.bot.closeWindow(opened).catch(() => undefined);
+    if (opened) void this.bot.closeWindow(opened).catch(() => undefined);
     this.bot.pathfinder.setGoal(null);
     this.bot.clearControlStates();
     this.buildCursor = undefined;
@@ -182,6 +185,8 @@ export class Skills {
       .filter((block) => !avoid || block.position.distanceTo(avoid) > 1.2)
       .sort((a, b) => a.position.distanceTo(player.position) - b.position.distanceTo(player.position))[0];
     if (!target) return { status: "done" };
+    const missing = await this.equipForMining(target);
+    if (missing) return { status: "blocked", message: `我没有合适的${missing}，挖不了这块。` };
     try {
       this.bot.pathfinder.setMovements(new Movements(this.bot));
       await this.bot.collectBlock.collect(target, { ignoreNoPath: true });
@@ -247,6 +252,7 @@ export class Skills {
     if (type === "sleep") return this.sleepNight();
     if (type === "tp" || type === "teleport") return this.teleportTo(playerName);
     if (type === "craft") return this.craftOne(intent);
+    if (type === "deposit" || type === "withdraw") return this.moveChest(intent, type);
     if (intent.block || intent.item) return this.collectOne({ ...intent, type: "collect" });
     if (intent.entity) return this.attack(intent);
     return this.explore();
@@ -306,6 +312,8 @@ export class Skills {
       this.walkAhead();
       return { status: "progress", message: `附近没有${label}，我再找找。` };
     }
+    const missing = await this.equipForMining(target);
+    if (missing) return { status: "blocked", message: `我没有合适的${missing}，挖不了${label}。` };
     try {
       this.bot.pathfinder.setMovements(new Movements(this.bot));
       await this.bot.collectBlock.collect(target, { ignoreNoPath: true });
@@ -340,6 +348,29 @@ export class Skills {
     this.bot.pathfinder.setMovements(new Movements(this.bot));
     this.bot.pathfinder.setGoal(new goals.GoalNear(entity.position.x, entity.position.y, entity.position.z, 2));
     return { status: "progress" };
+  }
+
+  private async equipForMining(block: { name: string; canHarvest: (itemType: number | null) => boolean }): Promise<string | undefined> {
+    const items = this.bot.inventory.items();
+    const choice = chooseHarvestTool({
+      blockName: block.name,
+      tools: items.map((item) => item.name),
+      canHarvest: (name) => {
+        const tool = items.find((item) => item.name === name);
+        return tool ? block.canHarvest(tool.type) : false;
+      },
+      handCanHarvest: block.canHarvest(null),
+    });
+    if (choice.missing) return choice.missing;
+    if (!choice.name || this.bot.heldItem?.name === choice.name) return undefined;
+    const tool = items.find((item) => item.name === choice.name);
+    if (!tool) return undefined;
+    try {
+      await this.bot.equip(tool, "hand");
+    } catch (error) {
+      console.warn("切换工具失败：", error);
+    }
+    return undefined;
   }
 
   private async equipWeapon(): Promise<void> {
@@ -559,6 +590,57 @@ export class Skills {
     return { status: "done", message: "我打开工作台了。要做木镐、箱子还是木门？" };
   }
 
+  private async moveChest(intent: ActionIntent, mode: "deposit" | "withdraw"): Promise<StepResult> {
+    const chest = this.findStorage();
+    const label = intent.label ?? (mode === "deposit" ? "背包里的东西" : "箱子里的东西");
+    if (!chest) return { status: "blocked", message: "附近没有箱子。" };
+    if (chest.position.distanceTo(this.bot.entity.position) > 3) {
+      this.bot.pathfinder.setMovements(new Movements(this.bot));
+      this.bot.pathfinder.setGoal(new goals.GoalNear(chest.position.x, chest.position.y, chest.position.z, 2));
+      return { status: "progress", message: "我去箱子那里。" };
+    }
+    this.bot.pathfinder.setGoal(null);
+    const names = storageNames(intent.item);
+    let opened: Chest | undefined;
+    try {
+      opened = await this.bot.openChest(chest);
+      const moved = mode === "deposit" ? await this.depositInto(opened, names) : await this.withdrawFrom(opened, names);
+      if (!moved) {
+        return { status: "blocked", message: mode === "deposit" ? "背包里没有这些东西。" : "箱子里没有这些东西。" };
+      }
+      return { status: "done", message: mode === "deposit" ? `我把${label}放进箱子了。` : `我从箱子里拿出了${label}。` };
+    } catch (error) {
+      console.warn("使用箱子失败：", error);
+      const text = error instanceof Error ? error.message : "";
+      if (text.includes("destination full")) return { status: "blocked", message: "箱子满了，放不下。" };
+      if (text.includes("inventory is full")) return { status: "blocked", message: "我背包满了，拿不了。" };
+      return { status: "blocked", message: "我打不开这只箱子。" };
+    } finally {
+      await opened?.close().catch(() => undefined);
+    }
+  }
+
+  private async depositInto(chest: Chest, names?: string[]): Promise<boolean> {
+    const stacks = this.bot.inventory.items().filter((item) => !names || names.includes(item.name));
+    if (!stacks.length) return false;
+    for (const stack of stacks) await chest.deposit(stack.type, null, stack.count);
+    return true;
+  }
+
+  private async withdrawFrom(chest: Chest, names?: string[]): Promise<boolean> {
+    const stacks = chest.containerItems().filter((item) => !names || names.includes(item.name));
+    if (!stacks.length) return false;
+    for (const stack of stacks) await chest.withdraw(stack.type, null, stack.count);
+    return true;
+  }
+
+  private findStorage(): Block | null {
+    return this.bot.findBlock({
+      matching: (block) => block.name === "chest" || block.name === "trapped_chest" || block.name === "barrel",
+      maxDistance: 32,
+    });
+  }
+
   private inventoryCounts(): Record<string, number> {
     const counts: Record<string, number> = {};
     for (const item of this.bot.inventory.items()) counts[item.name] = (counts[item.name] ?? 0) + item.count;
@@ -573,6 +655,22 @@ export class Skills {
     console.log(`发送传送命令 ${command}`);
     this.bot.chat(command);
     return { status: "done", message: `我传送过去了。要是没到身边，请先开作弊，再输入 /op ${this.bot.username}。` };
+  }
+
+  changeGameMode(mode: string, playerName: string, targetChild: boolean): StepResult {
+    const vanilla = mode === "creative" || mode === "adventure" || mode === "spectator" || mode === "survival" ? mode : "";
+    if (!vanilla) return { status: "blocked", message: "可以说生存、创造、冒险或旁观。" };
+    const labels: Record<string, string> = { survival: "生存", creative: "创造", adventure: "冒险", spectator: "旁观" };
+    const label = labels[vanilla];
+    const who = targetChild ? this.teleportTarget(playerName) : undefined;
+    if (targetChild && !who) return { status: "blocked", message: "这个名字不能写进模式命令。" };
+    const command = who ? `/gamemode ${vanilla} ${who}` : `/gamemode ${vanilla}`;
+    console.log(`发送模式命令 ${command}`);
+    this.bot.chat(command);
+    const message = who
+      ? `我把你改成${label}模式了。要是没变，请先开作弊，再输入 /op ${this.bot.username}。`
+      : `我切换到${label}模式了。要是没变，请先开作弊，再输入 /op ${this.bot.username}。`;
+    return { status: "done", message };
   }
 
   private teleportTarget(playerName: string): string | undefined {

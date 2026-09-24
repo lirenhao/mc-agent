@@ -40,6 +40,7 @@ export type Plan = {
   template?: BuildTemplate;
   entity?: string;
   item?: string;
+  store?: "deposit" | "withdraw";
   reply: string;
   criteria: Record<string, string>;
   missions: Record<string, MissionBlueprint>;
