@@ -39,6 +39,7 @@ export type Plan = {
   resource?: ResourceName;
   template?: BuildTemplate;
   entity?: string;
+  item?: string;
   reply: string;
   criteria: Record<string, string>;
   missions: Record<string, MissionBlueprint>;

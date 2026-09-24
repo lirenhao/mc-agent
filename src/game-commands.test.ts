@@ -10,6 +10,7 @@ test("game commands accept the prefix, a Chinese name, and a direct order", () =
   assert.equal(parseGameCommand("阿搭，睡觉", { persona: "阿搭" }), "睡觉");
   assert.equal(parseGameCommand("跟着我", { direct: true }), "跟着我");
   assert.equal(parseGameCommand("捡起来", { direct: true }), "捡起来");
+  assert.equal(parseGameCommand("做一把木镐", { direct: true }), "做一把木镐");
   assert.equal(parseGameCommand("你好呀", { direct: true }), undefined);
   assert.equal(parseGameCommand("/gamemode creative"), undefined);
 });

@@ -1,5 +1,6 @@
 import type { Bot } from "mineflayer";
 import { buildOffers, failureCooldown, filterOffers, planTrigger, type Offer, type RecentAction } from "./actions.js";
+import { craftLabel } from "./craft.js";
 import { config } from "./config.js";
 import { chooseMission, chooseOffer } from "./jev.js";
 import { Partner, type Assist } from "./partner.js";
@@ -543,11 +544,15 @@ export class Companion {
       this.trackProgress();
       this.noteResult(key, result, quiet);
       if (this.sticky(offer) || !this.mission) return;
-      if (offer.intent.type.toLowerCase() === "sleep") {
+      if (offer.intent.type.toLowerCase() === "sleep" || offer.intent.type.toLowerCase() === "craft") {
         if (result.status === "done") this.nextStep(playerName, state);
         if (result.status === "blocked") {
           this.holding = undefined;
           this.nextDecisionAt = 0;
+          if (offer.intent.type.toLowerCase() === "craft") {
+            this.mission = undefined;
+            this.skills.keepFollow(playerName, 3);
+          }
         }
         return;
       }
@@ -666,6 +671,7 @@ function fallbackBlueprint(id: string, plan: Plan): MissionBlueprint {
   if (id === "sit") return { mode: "sit", title: "坐下", steps: [{ type: "come" }, { type: "sit" }] };
   if (id === "sleep") return { mode: "sleep", title: "睡觉", steps: [{ type: "sleep", label: "睡觉" }] };
   if (id === "tp" || id === "teleport") return { mode: "focused", title: "传送", steps: [{ type: "tp", label: "传送" }] };
+  if (id === "craft") return { mode: "focused", title: plan.item ? craftLabel(plan.item) : "制作", steps: [{ type: "craft", item: plan.item, label: plan.item ? craftLabel(plan.item) : "制作" }] };
   if (id === "attack" || id === "hunt") return { mode: "hunt", title: "进攻", steps: [{ type: "attack", entity: plan.entity, label: plan.entity }] };
   if (id === "stop") return { mode: "stop", title: "停下", steps: [{ type: "stop" }] };
   return plan.missions[plan.skill] ?? { mode: "idle", steps: [{ type: "follow" }] };

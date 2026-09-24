@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { craftItemId, craftLabel, parseCraftRequest } from "./craft.js";
 import { DEFAULT_CRITERIA, SKILL_NAMES, type ActionIntent, type BuildTemplate, type MissionBlueprint, type MissionMode, type Plan, type ResourceName, type SkillName, type WorldState } from "./types.js";
 
 const resources: ResourceName[] = ["wood", "stone", "coal", "iron"];
@@ -12,6 +13,7 @@ export function isPickupRequest(text: string): boolean {
 export async function planMission(transcript: string, state: WorldState): Promise<Plan> {
   if (/(传送|瞬移|\btp\b)/i.test(transcript)) return withDefaultMissions(localPlan(transcript));
   if (isPickupRequest(transcript)) return withDefaultMissions(localPlan(transcript));
+  if (parseCraftRequest(transcript)) return withDefaultMissions(localPlan(transcript));
   if (!config.llm.baseUrl || !config.llm.apiKey || !config.llm.model) {
     return withDefaultMissions(localPlan(transcript));
   }
@@ -28,9 +30,10 @@ export async function planMission(transcript: string, state: WorldState): Promis
             role: "system",
             content: `你是 Minecraft 陪玩 ${config.persona.name}。风格：${config.persona.style}。只输出一个 JSON 对象，不要 markdown。
 格式：{"reply":"不超过35字","mode":"focused|follow|guard|hunt|sit|sleep|stop|idle","title":"短标题","steps":[{"type":"collect","block":"oak_log","count":8,"label":"木头"}]}
-type 只能是：follow, stop, protect, collect, attack, build, place, give, come, look, dance, eat, goto, sit, sleep, tp, wait。
+type 只能是：follow, stop, protect, collect, attack, build, place, give, come, look, dance, eat, goto, sit, sleep, tp, craft, wait。
 mode：follow=一直跟着；guard=保护；hunt=一直进攻直到停下；sit=坐下陪着；sleep=上床睡觉直到天亮；stop=停下；focused=按 steps 做完再回来。
 孩子要传送到身边时，type=tp，mode=focused。这会让机器人在游戏里发送 /tp，服务器必须允许它使用该命令。
+孩子要做东西时，type=craft，item 用英文 id（木板 oak_planks，木棍 stick，工作台 crafting_table，木镐 wooden_pickaxe，箱子 chest，火把 torch）。需要工作台的物品，机器人会自己找到或放下一张工作台再制作。
 多件事拆成有序 steps。例如砍树盖房：collect oak_log → come → build，template 只能是 cabin、farm、camp。
 block/item 用英文 id（木头用 oak_log，石头用 stone，煤用 coal_ore，铁用 iron_ore，花用 dandelion）。
 攻击时 type=attack，mode=hunt，entity 用 zombie、skeleton、spider、creeper 等；没点名就省略 entity。不要攻击玩家或村民。
@@ -150,6 +153,10 @@ function stepsFromSkill(skill: string, root: Record<string, unknown>): ActionInt
   if (id === "follow" || id === "stop" || id === "sit" || id === "protect") return [{ type: id }];
   if (id === "sleep") return [{ type: "sleep", label: "睡觉" }];
   if (id === "tp" || id === "teleport") return [{ type: "tp", label: "传送" }];
+  if (id === "craft") {
+    const item = typeof root.item === "string" ? craftItemId(root.item) ?? normalizeBlock(root.item) : undefined;
+    return [{ type: "craft", item, label: item ? craftLabel(item) : "制作" }];
+  }
   if (id === "status") return [{ type: "wait" }];
   if (id.includes("attack") || id.includes("hunt")) {
     const entity = typeof root.entity === "string" ? normalizeEntity(root.entity) : undefined;
@@ -233,6 +240,7 @@ const TYPE_ALIAS: Record<string, string> = {
   sit: "sit", rest: "sit", sneak: "sit", 坐下: "sit", 蹲下: "sit",
   sleep: "sleep", 睡觉: "sleep", 上床: "sleep", 过夜: "sleep",
   tp: "tp", teleport: "tp", 传送: "tp", 瞬移: "tp",
+  craft: "craft", 合成: "craft", 制作: "craft", 打造: "craft",
   wait: "wait", 等: "wait",
   find: "find", 找: "find",
   explore: "explore", 探索: "explore",
@@ -257,6 +265,8 @@ const BLOCK_ALIAS: Record<string, string> = {
 
 function normalizeBlock(name: string): string {
   const text = name.trim();
+  const crafted = craftItemId(text);
+  if (crafted) return crafted;
   return (BLOCK_ALIAS[text] ?? BLOCK_ALIAS[text.toLowerCase()] ?? text.replace(/^minecraft:/, "")).slice(0, 40);
 }
 
@@ -305,6 +315,14 @@ function withDefaultMissions(task: ReturnType<typeof localPlan>): Plan {
   if (task.skill === "tp") {
     criteria.tp = "孩子要机器人用服务器的传送命令到自己身边。";
     missions.tp = { mode: "focused", title: "传送", steps: [{ type: "tp", label: "传送" }] };
+  }
+  if (task.skill === "craft" && task.item) {
+    criteria.craft = "孩子要机器人自己用工作台或背包把材料做成东西。";
+    missions.craft = {
+      mode: "focused",
+      title: craftLabel(task.item),
+      steps: [{ type: "craft", item: task.item, label: craftLabel(task.item) }],
+    };
   }
   if (task.skill === "attack") {
     criteria.attack = "孩子要主动进攻附近的生物。";
@@ -357,6 +375,8 @@ function localPlan(text: string): Omit<Plan, "criteria" | "missions"> {
   if (/(停|别动|停止)/.test(text)) return { skill: "stop", reply: "好，我停在这里等你。" };
   if (/(跟着|跟我|跟随)/.test(text)) return { skill: "follow", reply: "好，我跟着你。" };
   if (isPickupRequest(text)) return { skill: "pickup", reply: "好，我去捡你掉的东西。" };
+  const craft = parseCraftRequest(text);
+  if (craft) return { skill: "craft", item: craft.item, reply: `好，我去做${craft.label}。` };
   const target = parseMob(text);
   if (/(攻击|进攻|开战|去打|打它|打怪|砍怪|打一打)/.test(text) || /打(僵尸|骷髅|蜘蛛|苦力怕|末影人|女巫|史莱姆|溺尸|猪|牛|羊|鸡)/.test(text)) {
     return {

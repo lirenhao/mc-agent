@@ -1,7 +1,9 @@
+import type { Block } from "prismarine-block";
 import type { Bot } from "mineflayer";
 import "mineflayer-collectblock";
 import pathfinderModule from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
+import { isCraftItem, nextCraftAction } from "./craft.js";
 import { ChildDrops, DROP_CLAIM_RADIUS, DROP_GIVE_UP_MS } from "./drops.js";
 import { isHostileEntity } from "./mobs.js";
 import type { ActionIntent, StepResult, WorldState } from "./types.js";
@@ -105,6 +107,8 @@ export class Skills {
 
   stop(): void {
     if (this.bot.isSleeping) void this.bot.wake().catch(() => undefined);
+    const opened = this.bot.currentWindow;
+    if (opened && /crafting/i.test(String(opened.type))) void this.bot.closeWindow(opened).catch(() => undefined);
     this.bot.pathfinder.setGoal(null);
     this.bot.clearControlStates();
     this.buildCursor = undefined;
@@ -242,6 +246,7 @@ export class Skills {
     if (type === "sit" || type === "sneak" || type === "rest") return this.sit(playerName);
     if (type === "sleep") return this.sleepNight();
     if (type === "tp" || type === "teleport") return this.teleportTo(playerName);
+    if (type === "craft") return this.craftOne(intent);
     if (intent.block || intent.item) return this.collectOne({ ...intent, type: "collect" });
     if (intent.entity) return this.attack(intent);
     return this.explore();
@@ -474,6 +479,87 @@ export class Skills {
       matching: (block) => this.bot.isABed(block),
       maxDistance,
     });
+  }
+
+  private async craftOne(intent: ActionIntent): Promise<StepResult> {
+    const item = intent.item ?? intent.block ?? "";
+    if (!isCraftItem(item)) return { status: "blocked", message: "我还不会做这个。可以说木板、木棍、工作台、木镐或箱子。" };
+    const table = this.findCraftingTable();
+    const have = this.inventoryCounts();
+    const action = nextCraftAction({
+      item,
+      have,
+      tableNearby: Boolean(table),
+      holdingTable: (have.crafting_table ?? 0) > 0,
+    });
+    if (action.kind === "done") return { status: "done", message: "工作台就在旁边，我可以用它。" };
+    if (action.kind === "missing") return { status: "blocked", message: `还缺${action.label}，我做不了。` };
+    if (action.kind === "place-table") return this.placeCraftingTable();
+    if (action.needsTable) {
+      if (!table) return { status: "blocked", message: "我找不到工作台。" };
+      if (table.position.distanceTo(this.bot.entity.position) > 3) {
+        this.bot.pathfinder.setMovements(new Movements(this.bot));
+        this.bot.pathfinder.setGoal(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+        return { status: "progress", message: "我去工作台那里。" };
+      }
+      this.bot.pathfinder.setGoal(null);
+    }
+    this.bot.pathfinder.setGoal(null);
+    try {
+      await this.performCraft(action.item, action.needsTable ? table ?? undefined : undefined);
+    } catch (error) {
+      console.warn("制作失败：", error);
+      const text = error instanceof Error ? error.message : "";
+      if (text.includes("missing ingredient") || text.includes("no recipe")) return { status: "blocked", message: "材料不够，我做不了。" };
+      return { status: "blocked", message: "我在工作台上没做成。" };
+    }
+    const finished = action.item === item;
+    return {
+      status: finished ? "done" : "progress",
+      message: action.needsTable ? `我在工作台上做了${action.label}。` : `我做了${action.label}。`,
+    };
+  }
+
+  private async performCraft(itemName: string, table?: Block): Promise<void> {
+    const item = this.bot.registry.itemsByName[itemName];
+    if (!item) throw new Error("no recipe");
+    let recipes = this.bot.recipesFor(item.id, null, 1, table ?? null);
+    if (!recipes.length) {
+      recipes = this.bot.recipesAll(item.id, null, table ?? false).filter((recipe) => this.recipeFits(recipe));
+    }
+    const recipe = recipes.find((candidate) => !candidate.requiresTable || table);
+    if (!recipe || (recipe.requiresTable && !table)) throw new Error("no recipe");
+    await this.bot.craft(recipe, 1, recipe.requiresTable ? table : undefined);
+  }
+
+  private recipeFits(recipe: { delta: Array<{ id: number; metadata: number | null; count: number }> }): boolean {
+    return recipe.delta.every((delta) => delta.count >= 0 || this.bot.inventory.count(delta.id, delta.metadata) + delta.count >= 0);
+  }
+
+  private findCraftingTable(): Block | null {
+    return this.bot.findBlock({
+      matching: (block) => block.name === "crafting_table",
+      maxDistance: 32,
+    });
+  }
+
+  private async placeCraftingTable(): Promise<StepResult> {
+    const origin = this.bot.entity.position.floored();
+    const spots = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [2, 0, 0], [0, 0, 2], [1, 0, 1], [-1, 0, 1]];
+    for (const [x, , z] of spots) {
+      const target = origin.offset(x, 0, z);
+      const ground = this.bot.blockAt(target.offset(0, -1, 0));
+      const above = this.bot.blockAt(target);
+      if (!above || above.name !== "air" || !ground || ground.name === "air" || /water|lava/.test(ground.name)) continue;
+      if (await this.placeAt(target, ["crafting_table"])) return { status: "progress", message: "我把工作台放好了。" };
+    }
+    return { status: "blocked", message: "旁边没空地放工作台。" };
+  }
+
+  private inventoryCounts(): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const item of this.bot.inventory.items()) counts[item.name] = (counts[item.name] ?? 0) + item.count;
+    return counts;
   }
 
   private teleportTo(playerName: string): StepResult {
