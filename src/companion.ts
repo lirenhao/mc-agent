@@ -116,6 +116,19 @@ export class Companion {
     this.sawDrop = false;
   }
 
+  private onTask(): boolean {
+    return Boolean(this.mission && this.mission.mode !== "follow" && this.mission.mode !== "stop");
+  }
+
+  private taskSteps(blueprint: MissionBlueprint): MissionBlueprint["steps"] {
+    if (blueprint.mode === "follow") return blueprint.steps;
+    const work = blueprint.steps.filter((step) => {
+      const type = step.type.toLowerCase();
+      return type !== "follow" && type !== "come";
+    });
+    return work.length ? work : blueprint.steps;
+  }
+
   private childName(): string {
     return config.companionPlayer || this.childOverride;
   }
@@ -153,8 +166,12 @@ export class Companion {
     if (plan.skill === "tp") return this.teleportNow(playerName, state, generation, plan.reply);
     if (plan.skill === "gamemode") return this.changeModeNow(playerName, plan, generation);
     if (plan.skill === "pickup") return this.pickupNow(playerName, generation);
-    const chosen = await chooseMission(plan, state);
+    let chosen = await chooseMission(plan, state);
     if (generation !== this.planGeneration) return plan.reply;
+    if ((chosen === "protect" || chosen === "stop") && plan.skill !== "protect" && plan.skill !== "stop" && plan.skill !== "clarify") {
+      const danger = state.health <= 6 && state.hostiles.some((hostile) => hostile.distance < 12);
+      if (!danger) chosen = plan.skill;
+    }
     this.skills.stop();
     this.stuck = 0;
     this.holding = undefined;
@@ -268,13 +285,14 @@ export class Companion {
 
   private createMission(id: string, reply: string, blueprint: MissionBlueprint): Mission {
     const now = Date.now();
-    const first = blueprint.steps[0];
+    const steps = this.taskSteps(blueprint);
+    const first = steps[0];
     return {
       id,
       title: blueprint.title ?? reply.slice(0, 18),
       reply,
       mode: blueprint.mode,
-      steps: blueprint.steps,
+      steps,
       stepIndex: 0,
       startedAt: now,
       lastProgressAt: now,
@@ -303,7 +321,11 @@ export class Companion {
       this.skills.keepFollow(playerName, 4);
       return;
     }
-    if (this.holding?.sustain && Date.now() < this.nextDecisionAt) {
+    if (this.onTask() && this.holding?.key === "follow") {
+      this.holding = undefined;
+      this.skills.stop();
+    }
+    if (this.holding?.sustain && Date.now() < this.nextDecisionAt && !(this.onTask() && this.holding.key === "follow")) {
       await this.runOffer(this.holding, playerName, state, true);
       return;
     }
@@ -358,6 +380,22 @@ export class Companion {
     this.nextDecisionAt = Date.now() + DECISION_MS;
     try {
       const step = this.mission?.steps[this.mission.stepIndex];
+      if (this.onTask()) {
+        if (!step) {
+          this.finish(playerName, "做完了，我回来找你。");
+          return;
+        }
+        const offer: Offer = {
+          key: `mission:${step.type}:${step.block ?? step.entity ?? step.template ?? "go"}`,
+          description: `继续「${this.mission?.title ?? "任务"}」：${step.label ?? step.type}`,
+          intent: step,
+          sustain: this.mission?.mode === "hunt" || this.mission?.mode === "guard" || this.mission?.mode === "sit" || this.mission?.mode === "sleep",
+        };
+        this.holding = offer;
+        if (!offer.sustain) this.nextDecisionAt = 0;
+        await this.runOffer(offer, playerName, state, false);
+        return;
+      }
       this.assist = this.stayPut
         ? { kind: "follow" }
         : this.partner.decide(this.bot, playerName, {
@@ -385,7 +423,7 @@ export class Companion {
       this.noUseful = offers.every((offer) => offer.key === "wait");
       if (this.noUseful) {
         this.failures += 1;
-        this.skills.keepFollow(playerName, 3);
+        if (!this.mission || this.mission.mode === "follow") this.skills.keepFollow(playerName, 3);
         return;
       }
       const offer = await chooseOffer(offers, state);
@@ -421,7 +459,7 @@ export class Companion {
           await this.skills.progress({ type: "attack", entity: name, label: name }, playerName, state);
         });
       } else {
-        this.skills.protectOnce(playerName);
+        this.skills.protectOnce(playerName, !this.onTask());
       }
       return true;
     }
@@ -537,7 +575,7 @@ export class Companion {
           this.nextDecisionAt = 0;
           if (offer.intent.type.toLowerCase() !== "sleep") {
             this.mission = undefined;
-            this.skills.keepFollow(playerName, 3);
+            this.skills.stop();
           }
         }
         return;

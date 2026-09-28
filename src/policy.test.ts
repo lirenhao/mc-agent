@@ -58,6 +58,16 @@ test("a command task is chosen ahead of following", () => {
     mission: { mode: "focused", title: "做木镐", step: { type: "craft", block: "wooden_pickaxe", label: "木镐" } },
   });
   assert.equal(offers.some((offer) => offer.key === "follow"), false);
+  const idle = buildOffers({
+    stayPut: false,
+    childVisible: true,
+    night: false,
+    defense: false,
+    canLight: false,
+    canSleep: false,
+    mission: { mode: "idle", title: "砍树", step: { type: "collect", block: "oak_log" } },
+  });
+  assert.equal(idle.some((offer) => offer.key === "follow"), false);
   assert.equal(preferOffer(filterOffers(offers, { unsafe: false, cooled: new Set() })).key.startsWith("mission:"), true);
   const withFollow: Offer[] = [
     ...offers,

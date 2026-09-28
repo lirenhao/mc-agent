@@ -122,7 +122,8 @@ export function buildOffers(input: {
   if (input.mission?.mode === "sit") {
     offers.push({ key: "sit", description: "走到孩子身边坐下陪着。", intent: { type: "sit" }, sustain: true });
   }
-  const busyTask = Boolean(input.mission && input.mission.mode !== "follow" && input.mission.mode !== "idle" && input.mission.mode !== "stop");
+  const stepType = input.mission?.step?.type.toLowerCase();
+  const busyTask = Boolean(input.mission && input.mission.mode !== "follow" && input.mission.mode !== "stop" && stepType !== "follow");
   if (input.childVisible && !input.stayPut && !busyTask) {
     offers.push({
       key: "follow",

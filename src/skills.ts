@@ -142,11 +142,11 @@ export class Skills {
     if (player?.entity) void this.bot.lookAt(player.entity.position.offset(0, 1.2, 0));
   }
 
-  protectOnce(playerName: string): boolean {
+  protectOnce(playerName: string, allowFollow = true): boolean {
     const player = this.bot.players[playerName];
     const hostile = this.nearestHostile();
     if (!hostile) {
-      if (player?.entity) this.keepFollow(playerName, 2);
+      if (allowFollow && player?.entity) this.keepFollow(playerName, 2);
       return false;
     }
     if (hostile.name === "creeper" || this.bot.health <= 6) {
