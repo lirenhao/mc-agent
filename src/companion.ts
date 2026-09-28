@@ -12,7 +12,6 @@ import { getWorldState } from "./world-state.js";
 const TICK_MS = 650;
 const MISSION_LIMIT_MS = 5 * 60_000;
 const CHAT_GAP_MS = 8_000;
-const CATCH_UP_BLOCKS = 26;
 const STUCK_TICKS = 10;
 const ERRAND_GAP_MS = 45_000;
 const TORCH_GAP_MS = 90_000;
@@ -296,18 +295,12 @@ export class Companion {
     if (this.busy) return;
     if (await this.maybeEat()) return;
     if (this.gatherDrops(playerName)) return;
-
     if (this.mission && Date.now() - this.mission.startedAt > MISSION_LIMIT_MS) {
       this.say("这件事变久了，我先回到你身边。", true);
       this.mission = undefined;
       this.holding = undefined;
       this.skills.stop();
       this.skills.keepFollow(playerName, 4);
-      return;
-    }
-    if (this.shouldCatchUp(state) && this.mission?.mode === "focused") {
-      this.skills.keepFollow(playerName, 3);
-      this.say("你走远了，我先跟上。");
       return;
     }
     if (this.holding?.sustain && Date.now() < this.nextDecisionAt) {
@@ -448,11 +441,7 @@ export class Companion {
   private noticeNight(state: WorldState): void {
     if (this.lastNightNotice === state.time) return;
     this.lastNightNotice = state.time;
-    if (state.time === "night") this.say("天黑了，我挨着你。");
-  }
-
-  private shouldCatchUp(state: WorldState): boolean {
-    return Boolean(state.childVisible && state.childDistance !== undefined && state.childDistance > CATCH_UP_BLOCKS);
+    if (state.time === "night" && !this.mission) this.say("天黑了，我挨着你。");
   }
 
   private async runOffer(offer: Offer, playerName: string, state: WorldState, quiet: boolean): Promise<void> {

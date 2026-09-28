@@ -18,6 +18,7 @@ export async function planMission(transcript: string, state: WorldState): Promis
   if (isPickupRequest(transcript)) return withDefaultMissions(localPlan(transcript));
   if (parseStorageRequest(transcript)) return withDefaultMissions(localPlan(transcript));
   if (parseCraftRequest(transcript)) return withDefaultMissions(localPlan(transcript));
+  if (sparTarget(transcript)) return withDefaultMissions(localPlan(transcript));
   if (!config.llm.baseUrl || !config.llm.apiKey || !config.llm.model) {
     return withDefaultMissions(localPlan(transcript));
   }
@@ -41,7 +42,7 @@ mode：follow=一直跟着；guard=保护；hunt=一直进攻直到停下；sit=
 孩子要做东西时，type=craft，item 用英文 id（木板 oak_planks，木棍 stick，木镐 wooden_pickaxe，箱子 chest，火把 torch）。只使用附近已经放好的工作台，不要制作或放置工作台。没有工作台就说明做不了。孩子只说用工作台时，item=use_table。
 多件事拆成有序 steps。例如砍树盖房：collect oak_log → come → build，template 只能是 cabin、farm、camp。
 block/item 用英文 id（木头用 oak_log，石头用 stone，煤用 coal_ore，铁用 iron_ore，花用 dandelion）。
-攻击时 type=attack，mode=hunt，entity 用 zombie、skeleton、spider、creeper 等；没点名就省略 entity。不要攻击玩家或村民。
+攻击时 type=attack，mode=hunt。打怪时 entity 用 zombie、skeleton、spider、creeper 等，没点名就省略 entity。孩子要对战时 entity=player。孩子要打村民时 entity=villager。不要攻击其他玩家。
 听不懂时 steps 用 [{"type":"wait"}]，reply 请孩子再说具体一点。`,
           },
           {
@@ -115,7 +116,7 @@ function interpretModel(value: unknown, transcript: string): Plan {
     criteria: {
       do: blueprint.title || reply,
       protect: "孩子附近有危险，先保护而不是继续原任务。",
-      stop: "任务会伤害玩家或村民，或者不该执行。",
+      stop: "任务不该执行。孩子要求对战或攻击村民时，不要因此停下。",
     },
     missions: {
       do: blueprint,
@@ -275,7 +276,16 @@ function normalizeBlock(name: string): string {
   return (BLOCK_ALIAS[text] ?? BLOCK_ALIAS[text.toLowerCase()] ?? text.replace(/^minecraft:/, "")).slice(0, 40);
 }
 
+export function sparTarget(text: string): "player" | "villager" | undefined {
+  if (/(僵尸村民|zombie_villager)/i.test(text)) return undefined;
+  if (/(村民|villager)/i.test(text) && /(攻击|进攻|去打|打|对战)/.test(text)) return "villager";
+  if (/(对战|攻击我|来打我|跟我打|跟我对打|和我打|打一下我)/.test(text)) return "player";
+  if (/打我(?!的|身边|旁边)/.test(text)) return "player";
+  return undefined;
+}
+
 function normalizeEntity(name: string): string | undefined {
+  if (/^(我|你|孩子|玩家|player|child)$/i.test(name.trim())) return "player";
   const known = parseMob(name);
   if (known) return known.id;
   const raw = name.trim().toLowerCase().replace(/^minecraft:/, "");
@@ -339,10 +349,11 @@ function withDefaultMissions(task: ReturnType<typeof localPlan>): Plan {
     };
   }
   if (task.skill === "attack") {
-    criteria.attack = "孩子要主动进攻附近的生物。";
+    const spar = task.entity === "player" || task.entity === "villager";
+    criteria.attack = spar ? "孩子明确要求对战，或要求攻击村民。" : "孩子要主动进攻附近的生物。";
     missions.attack = {
       mode: "hunt",
-      title: task.entity ? `打${mobLabel(task.entity)}` : "进攻",
+      title: task.entity === "player" ? "对战" : task.entity ? `打${mobLabel(task.entity)}` : "进攻",
       steps: [{ type: "attack", entity: task.entity, label: task.entity ? mobLabel(task.entity) : "附近的怪物" }],
     };
   }
@@ -390,6 +401,9 @@ function localPlan(text: string): Omit<Plan, "criteria" | "missions"> {
   if (/(睡觉|去睡|上床|跳过夜晚|睡到天亮|过夜)/.test(text)) return { skill: "sleep", reply: "好，我去床上睡觉。你也上床，我们就能到天亮。" };
   if (/(坐下|蹲下|坐着|坐下来|休息一下)/.test(text)) return { skill: "sit", reply: "好，我坐下来陪你。" };
   if (/(停|别动|停止)/.test(text)) return { skill: "stop", reply: "好，我停在这里等你。" };
+  const spar = sparTarget(text);
+  if (spar === "player") return { skill: "attack", entity: "player", reply: "好，我们来对战。" };
+  if (spar === "villager") return { skill: "attack", entity: "villager", reply: "好，我去打村民。" };
   if (/(跟着|跟我|跟随)/.test(text)) return { skill: "follow", reply: "好，我跟着你。" };
   if (isPickupRequest(text)) return { skill: "pickup", reply: "好，我去捡你掉的东西。" };
   const storage = parseStorageRequest(text);
@@ -434,6 +448,7 @@ const MOBS: Array<{ pattern: RegExp; id: string; label: string }> = [
   { pattern: /牛/, id: "cow", label: "牛" },
   { pattern: /羊/, id: "sheep", label: "羊" },
   { pattern: /鸡/, id: "chicken", label: "鸡" },
+  { pattern: /村民|villager/i, id: "villager", label: "村民" },
 ];
 
 function parseMob(text: string): { id: string; label: string } | undefined {
@@ -441,5 +456,6 @@ function parseMob(text: string): { id: string; label: string } | undefined {
 }
 
 function mobLabel(id: string): string {
+  if (id === "player" || id === "child") return "你";
   return MOBS.find((mob) => mob.id === id)?.label ?? id;
 }

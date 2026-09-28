@@ -8,6 +8,8 @@ const HIGH_STAKES = new Set(["retreat", "protect", "stop"]);
 export function selectJudgedOffer(offers: Offer[], choice: string | undefined, confidence: number, minConfidence: number): Offer {
   const unique = uniqueOffers(offers);
   const offer = unique.find((item) => item.key === choice);
+  const task = unique.some((item) => item.key.startsWith("mission:"));
+  if (offer?.key === "follow" && task) return preferOffer(unique.filter((item) => item.key !== "follow"));
   if (!offer || (HIGH_STAKES.has(offer.key) && confidence < minConfidence)) return preferOffer(unique);
   return offer;
 }
@@ -78,9 +80,9 @@ export async function chooseMission(plan: Plan, state: WorldState): Promise<stri
             type: "choice",
             instructions: "Decide whether the companion should start the proposed task now.",
             criteria: {
-              do: "Start the proposed task. Choose this unless a hostile mob is an immediate threat or the task would harm a player or villager.",
+              do: "Start the proposed task. Sparring with the child or attacking a villager is allowed when the child asked. Choose this unless a hostile mob is an immediate threat.",
               protect: "Do not start the task. A hostile mob is close or health is very low, so protect the child instead.",
-              stop: "Do not start the task. It would harm a player or villager, or it should clearly not be done.",
+              stop: "Do not start the task when it should clearly not be done. Do not refuse a requested spar with the child or a requested attack on a villager.",
             },
           },
         },

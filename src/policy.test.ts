@@ -47,6 +47,25 @@ test("night sleep is offered, and danger drops it", () => {
   assert.equal(preferOffer(offers.filter((offer) => offer.key !== "retreat" && offer.key !== "protect")).key, "follow");
 });
 
+test("a command task is chosen ahead of following", () => {
+  const offers = buildOffers({
+    stayPut: false,
+    childVisible: true,
+    night: false,
+    defense: false,
+    canLight: false,
+    canSleep: false,
+    mission: { mode: "focused", title: "做木镐", step: { type: "craft", block: "wooden_pickaxe", label: "木镐" } },
+  });
+  assert.equal(offers.some((offer) => offer.key === "follow"), false);
+  assert.equal(preferOffer(filterOffers(offers, { unsafe: false, cooled: new Set() })).key.startsWith("mission:"), true);
+  const withFollow: Offer[] = [
+    ...offers,
+    { key: "follow", description: "跟着孩子", intent: { type: "follow" }, sustain: true },
+  ];
+  assert.equal(selectJudgedOffer(withFollow, "follow", 0.99, 0.85).key.startsWith("mission:"), true);
+});
+
 test("Jev action keys execute directly, and an unsure stop does not", () => {
   const offers: Offer[] = [
     { key: "mission:collect:oak_log", description: "继续砍树", intent: { type: "collect", block: "oak_log" }, sustain: false },

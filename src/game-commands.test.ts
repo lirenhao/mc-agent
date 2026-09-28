@@ -9,6 +9,8 @@ test("game commands accept the prefix, a Chinese name, and a direct order", () =
   assert.equal(parseGameCommand("!bot"), "状态");
   assert.equal(parseGameCommand("阿搭，睡觉", { persona: "阿搭" }), "睡觉");
   assert.equal(parseGameCommand("跟着我", { direct: true }), "跟着我");
+  assert.equal(parseGameCommand("跟我对战", { direct: true }), "跟我对战");
+  assert.equal(parseGameCommand("打村民", { direct: true }), "打村民");
   assert.equal(parseGameCommand("捡起来", { direct: true }), "捡起来");
   assert.equal(parseGameCommand("做一把木镐", { direct: true }), "做一把木镐");
   assert.equal(parseGameCommand("从箱子里拿火把", { direct: true }), "从箱子里拿火把");
