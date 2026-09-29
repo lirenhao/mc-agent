@@ -8,6 +8,8 @@ import { isCraftItem, nextCraftAction } from "./craft.js";
 import { storageNames } from "./storage.js";
 import { chooseHarvestTool } from "./tools.js";
 import { ChildDrops, DROP_CLAIM_RADIUS, DROP_GIVE_UP_MS } from "./drops.js";
+import { controlsFor, isClosing, pickDodge, strafeOf, unitAway, type DodgeKind } from "./dodge.js";
+import { doorIsClosed, isToggleDoor } from "./doors.js";
 import { isHostileEntity } from "./mobs.js";
 import { templateBlocks } from "./materials.js";
 import type { ActionIntent, StepResult, WorldState } from "./types.js";
@@ -22,6 +24,7 @@ const resourceBlocks: Record<string, string[]> = {
 };
 
 const neverAttack = new Set(["player", "villager", "wandering_trader", "iron_golem", "snow_golem", "cat", "wolf", "allay", "parrot"]);
+const projectiles = new Set(["arrow", "spectral_arrow", "trident", "small_fireball", "fireball", "large_fireball", "wither_skull", "shulker_bullet", "dragon_fireball", "wind_charge"]);
 
 export class Skills {
   private buildCursor?: {
@@ -35,9 +38,138 @@ export class Skills {
   private readonly skippedBlocks = new Map<string, number>();
   private walkMoves?: InstanceType<typeof Movements>;
   private digMoves?: InstanceType<typeof Movements>;
+  private readonly doorOpenedAt = new Map<string, number>();
   private watchingDrops = false;
+  private dodgeWatching = false;
+  private sparring: () => boolean = () => false;
+  private dodging = false;
+  private dodgeKind?: DodgeKind;
+  private dodgeUntil = 0;
+  private dodgeSide: 1 | -1 = 1;
+  private dodgeAnchor = { x: 0, z: 0, at: 0 };
+  private stuckDodge = false;
+  private previousHealth = 20;
+  private lastSwing = 0;
+  private lastDodgeError = 0;
 
   constructor(private readonly bot: Bot) {}
+
+  watchDodge(sparring: () => boolean): void {
+    this.sparring = sparring;
+    if (this.dodgeWatching) return;
+    this.dodgeWatching = true;
+    this.bot.on("physicsTick", () => {
+      try {
+        if (!this.bot.entity) return;
+        this.dodgeIncoming();
+      } catch (error) {
+        if (Date.now() - this.lastDodgeError > 5_000) {
+          this.lastDodgeError = Date.now();
+          console.warn(`躲避失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    });
+  }
+
+  dodgeState(): DodgeKind | undefined {
+    if (!this.dodging && Date.now() >= this.dodgeUntil) return undefined;
+    return this.dodgeKind;
+  }
+
+  private dodgeIncoming(): DodgeKind | undefined {
+    const here = this.bot.entity.position;
+    const health = this.bot.health;
+    const justHurt = health < this.previousHealth - 0.05;
+    this.previousHealth = health;
+    const candidates = [];
+    const entities = [];
+    for (const entity of Object.values(this.bot.entities)) {
+      if (!entity?.name || entity === this.bot.entity) continue;
+      const distance = entity.position.distanceTo(here);
+      if (distance > 16) continue;
+      const projectile = projectiles.has(entity.name);
+      const player = entity.type === "player" || entity.name === "player";
+      const hostile = isHostileEntity(entity);
+      if (!projectile && !player && !hostile) continue;
+      const velocity = entity.velocity;
+      candidates.push({
+        name: entity.name,
+        x: entity.position.x,
+        z: entity.position.z,
+        distance,
+        hostile,
+        projectile,
+        player,
+        closing: projectile && velocity ? isClosing(entity.position, velocity, here) : false,
+      });
+      entities.push(entity);
+    }
+    const choice = pickDodge({ health, justHurt, sparring: this.sparring(), candidates });
+    if (!choice) {
+      if (Date.now() < this.dodgeUntil) return this.dodgeKind;
+      if (this.dodging) {
+        this.bot.clearControlStates();
+        this.dodging = false;
+      }
+      return undefined;
+    }
+    const threat = entities[choice.index];
+    const candidate = candidates[choice.index];
+    this.bot.pathfinder.setGoal(null);
+    if (!this.dodging) {
+      this.releaseForDodge();
+      if (choice.kind === "strafe") void this.equipWeapon();
+    }
+    this.dodging = true;
+    this.dodgeKind = choice.kind;
+    this.dodgeUntil = Date.now() + 450;
+    const away = unitAway(here, candidate) ?? { x: 1, z: 0 };
+    const now = Date.now();
+    if (now - this.dodgeAnchor.at > 500) {
+      const moved = Math.hypot(here.x - this.dodgeAnchor.x, here.z - this.dodgeAnchor.z);
+      this.stuckDodge = this.dodgeAnchor.at > 0 && moved < 0.35;
+      this.dodgeAnchor = { x: here.x, z: here.z, at: now };
+      if (this.stuckDodge) this.dodgeSide = this.dodgeSide === 1 ? -1 : 1;
+    }
+    const dir = choice.kind === "strafe" || this.stuckDodge ? strafeOf(away, this.dodgeSide) : away;
+    const controls = controlsFor(this.bot.entity.yaw, dir);
+    this.bot.setControlState("forward", controls.forward);
+    this.bot.setControlState("back", controls.back);
+    this.bot.setControlState("left", controls.left);
+    this.bot.setControlState("right", controls.right);
+    this.bot.setControlState("sprint", true);
+    this.bot.setControlState("sneak", false);
+    this.bot.setControlState("jump", choice.kind === "flee" || this.stuckDodge || justHurt || candidate.projectile);
+    if (choice.kind === "strafe" && threat && this.canSwing(threat) && now - this.lastSwing > 500) {
+      this.lastSwing = now;
+      void this.bot.lookAt(threat.position.offset(0, (threat.height ?? 1.6) * 0.7, 0), true);
+      this.bot.attack(threat);
+    }
+    return choice.kind;
+  }
+
+  private canSwing(entity: { name?: string; type?: string }): boolean {
+    if (!entity.name || entity.name === "creeper" || projectiles.has(entity.name)) return false;
+    if (entity.type === "player" || entity.name === "player") return this.sparring();
+    if (neverAttack.has(entity.name)) return false;
+    return isHostileEntity(entity);
+  }
+
+  private releaseForDodge(): void {
+    if (this.bot.targetDigBlock) this.bot.stopDigging();
+    const opened = this.bot.currentWindow;
+    if (opened) void this.bot.closeWindow(opened).catch(() => undefined);
+    void this.bot.collectBlock?.cancelTask();
+    if (this.bot.isSleeping) void this.bot.wake().catch(() => undefined);
+    console.log("躲开攻击");
+  }
+
+  private fleeFrom(position: { x: number; z: number }): void {
+    const away = unitAway(this.bot.entity.position, position) ?? { x: 1, z: 0 };
+    const here = this.bot.entity.position;
+    this.useWalk();
+    this.bot.pathfinder.setGoal(new goals.GoalNear(here.x + away.x * 8, here.y, here.z + away.z * 8, 1));
+  }
 
   watchChildDrops(childName: () => string): void {
     if (this.watchingDrops) return;
@@ -111,6 +243,50 @@ export class Skills {
     this.buildCursor = undefined;
   }
 
+  async openDoorAhead(force = false): Promise<boolean> {
+    const door = this.doorInFront();
+    if (!door) return false;
+    const props = door.getProperties() as { open?: boolean | string | number };
+    if (!doorIsClosed(props.open)) return false;
+    const key = `${door.position.x},${door.position.y},${door.position.z}`;
+    if (!force && Date.now() - (this.doorOpenedAt.get(key) ?? 0) < 2_500) return false;
+    this.doorOpenedAt.set(key, Date.now());
+    try {
+      await this.bot.lookAt(door.position.offset(0.5, 0.5, 0.5), true);
+      await this.bot.activateBlock(door);
+      console.log(`打开 ${door.name} ${key}`);
+      return true;
+    } catch (error) {
+      console.warn(`开门失败：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  private doorInFront(): Block | null {
+    const pos = this.bot.entity.position;
+    const yaw = this.bot.entity.yaw;
+    let dx = -Math.sin(yaw);
+    let dz = -Math.cos(yaw);
+    const goal = this.bot.pathfinder?.goal as { x?: number; z?: number; entity?: { position: { x: number; z: number } } } | null;
+    if (goal?.entity) {
+      dx = goal.entity.position.x - pos.x;
+      dz = goal.entity.position.z - pos.z;
+    } else if (typeof goal?.x === "number" && typeof goal.z === "number") {
+      dx = goal.x - pos.x;
+      dz = goal.z - pos.z;
+    }
+    const stepX = Math.abs(dx) >= Math.abs(dz) ? Math.sign(dx) : 0;
+    const stepZ = Math.abs(dz) > Math.abs(dx) ? Math.sign(dz) : 0;
+    const origin = pos.floored();
+    const spots = [origin.offset(stepX, 0, stepZ), origin.offset(stepX, 1, stepZ)];
+    if (stepX === 0 && stepZ === 0) spots.push(origin, origin.offset(0, 1, 0));
+    for (const spot of spots) {
+      const block = this.bot.blockAt(spot);
+      if (block && isToggleDoor(block.name)) return block;
+    }
+    return null;
+  }
+
   bedNearby(maxDistance = 32): boolean {
     return Boolean(this.nearestBed(maxDistance));
   }
@@ -140,8 +316,7 @@ export class Skills {
       return false;
     }
     if (hostile.name === "creeper" || this.bot.health <= 6) {
-      this.useWalk();
-      this.bot.pathfinder.setGoal(new goals.GoalNear(this.bot.entity.position.x - 8, this.bot.entity.position.y, this.bot.entity.position.z - 8, 2));
+      this.fleeFrom(hostile.position);
       return true;
     }
     if (hostile.position.distanceTo(this.bot.entity.position) < 3.2) this.bot.attack(hostile);
@@ -163,7 +338,7 @@ export class Skills {
       if (!isHostileEntity(entity)) continue;
       const distance = entity.position.distanceTo(position);
       if (distance > radius) continue;
-      if (!closest || distance < closest.distance) closest = { name: entity.name, distance };
+      if (!closest || distance < closest.distance) closest = { name: entity.name ?? "hostile", distance };
     }
     return closest;
   }
@@ -341,8 +516,7 @@ export class Skills {
 
   private strike(entity: NonNullable<ReturnType<Bot["nearestEntity"]>>): StepResult {
     if (entity.name === "creeper") {
-      this.useWalk();
-      this.bot.pathfinder.setGoal(new goals.GoalNear(this.bot.entity.position.x - 8, this.bot.entity.position.y, this.bot.entity.position.z - 8, 2));
+      this.fleeFrom(entity.position);
       return { status: "progress", message: "那是苦力怕，我们先撤开。" };
     }
     void this.bot.lookAt(entity.position.offset(0, (entity.height ?? 1.6) * 0.7, 0));
@@ -798,6 +972,7 @@ export class Skills {
     const walk = new Movements(this.bot);
     walk.canDig = false;
     walk.allow1by1towers = false;
+    walk.canOpenDoors = true;
     const dig = new Movements(this.bot);
     dig.canDig = true;
     dig.allow1by1towers = false;

@@ -52,6 +52,7 @@ export class Companion {
   private pickupSince = 0;
   private sawDrop = false;
   private judgedStep = -1;
+  private lastDodgeSay = 0;
   private recent: RecentAction[] = [];
   private readonly cooled = new Map<string, number>();
   private timer?: NodeJS.Timeout;
@@ -64,6 +65,7 @@ export class Companion {
 
   start(): void {
     this.partner.bind(this.bot, this.childName());
+    this.skills.watchDodge(() => this.sparring());
     this.skills.watchChildDrops(() => this.childName());
     this.timer = setInterval(() => void this.tick(), TICK_MS);
   }
@@ -151,6 +153,18 @@ export class Companion {
     return config.companionPlayer || this.childOverride;
   }
 
+  private sparring(): boolean {
+    const step = this.mission?.steps[this.mission.stepIndex];
+    const entity = step?.entity ?? this.holding?.intent.entity;
+    return entity === "player" || entity === "child";
+  }
+
+  private noteDodge(kind: "flee" | "strafe"): void {
+    if (Date.now() - this.lastDodgeSay < 6_000) return;
+    this.lastDodgeSay = Date.now();
+    this.say(kind === "flee" ? "我先躲开。" : "我躲开了。", true);
+  }
+
   private snapshot(): WorldState {
     return { ...getWorldState(this.bot, this.childName(), this.mission), recent: this.recent.slice(-5) };
   }
@@ -184,6 +198,7 @@ export class Companion {
     if (plan.skill === "tp") return this.teleportNow(playerName, state, generation, plan.reply);
     if (plan.skill === "gamemode") return this.changeModeNow(playerName, plan, generation);
     if (plan.skill === "pickup") return this.pickupNow(playerName, generation);
+    if (plan.skill === "door") return this.openDoorNow(generation);
     let chosen = await chooseMission(plan, state);
     if (generation !== this.planGeneration) return plan.reply;
     if ((chosen === "protect" || chosen === "stop") && plan.skill !== "protect" && plan.skill !== "stop" && plan.skill !== "clarify") {
@@ -216,6 +231,14 @@ export class Companion {
       console.log(`长任务「${this.mission.title}」：${steps}`);
     }
     const message = buildReply(this.mission.steps, plan.reply);
+    this.say(message, true);
+    return message;
+  }
+
+  private async openDoorNow(generation: number): Promise<string> {
+    const opened = await this.skills.openDoorAhead(true);
+    if (generation !== this.planGeneration) return opened ? "门开了。" : "面前没有关上的门。";
+    const message = opened ? "门开了。" : "面前没有关上的门。";
     this.say(message, true);
     return message;
   }
@@ -324,6 +347,12 @@ export class Companion {
 
   private async tick(): Promise<void> {
     if (!this.bot.entity) return;
+    const dodge = this.skills.dodgeState();
+    if (dodge) {
+      this.noteDodge(dodge);
+      return;
+    }
+    void this.skills.openDoorAhead();
     const playerName = this.childName();
     if (!playerName) return;
     const state = this.snapshot();

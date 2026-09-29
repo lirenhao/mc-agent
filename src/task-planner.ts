@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { isDoorRequest } from "./doors.js";
 import { craftItemId, craftLabel, parseCraftRequest } from "./craft.js";
 import { parseGameMode } from "./gamemode.js";
 import { parseStorageRequest, storageLabel } from "./storage.js";
@@ -19,6 +20,7 @@ export async function planMission(transcript: string, state: WorldState): Promis
   if (parseStorageRequest(transcript)) return withDefaultMissions(localPlan(transcript));
   if (parseCraftRequest(transcript)) return withDefaultMissions(localPlan(transcript));
   if (sparTarget(transcript)) return withDefaultMissions(localPlan(transcript));
+  if (isDoorRequest(transcript)) return withDefaultMissions(localPlan(transcript));
   if (!config.llm.baseUrl || !config.llm.apiKey || !config.llm.model) {
     return withDefaultMissions(localPlan(transcript));
   }
@@ -404,6 +406,7 @@ function localPlan(text: string): Omit<Plan, "criteria" | "missions"> {
   const spar = sparTarget(text);
   if (spar === "player") return { skill: "attack", entity: "player", reply: "好，我们来对战。" };
   if (spar === "villager") return { skill: "attack", entity: "villager", reply: "好，我去打村民。" };
+  if (isDoorRequest(text)) return { skill: "door", reply: "好，我来开门。" };
   if (/(跟着|跟我|跟随)/.test(text)) return { skill: "follow", reply: "好，我跟着你。" };
   if (isPickupRequest(text)) return { skill: "pickup", reply: "好，我去捡你掉的东西。" };
   const storage = parseStorageRequest(text);
