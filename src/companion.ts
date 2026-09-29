@@ -1,0 +1,763 @@
+import type { Bot } from "mineflayer";
+import { buildOffers, failureCooldown, filterOffers, planTrigger, type Offer, type RecentAction } from "./actions.js";
+import { craftLabel } from "./craft.js";
+import { config } from "./config.js";
+import { chooseMission, chooseOffer, judgePlannedStep } from "./jev.js";
+import { Partner, type Assist } from "./partner.js";
+import { buildReply, prepareTaskSteps } from "./materials.js";
+import { Skills } from "./skills.js";
+import { planMission } from "./task-planner.js";
+import type { Mission, MissionBlueprint, Plan, StepResult, WorldState } from "./types.js";
+import { getWorldState } from "./world-state.js";
+
+const TICK_MS = 650;
+const MISSION_LIMIT_MS = 5 * 60_000;
+const CHAT_GAP_MS = 8_000;
+const STUCK_TICKS = 10;
+const ERRAND_GAP_MS = 45_000;
+const TORCH_GAP_MS = 90_000;
+const DECISION_MS = 2_500;
+
+type Pending = { text: string; playerName: string; resolve: (message: string) => void };
+
+export class Companion {
+  private mission?: Mission;
+  private busy = false;
+  private planning = false;
+  private pending?: Pending;
+  private active?: Pending;
+  private stayPut = false;
+  private emergency = false;
+  private lastChat = 0;
+  private lastEat = 0;
+  private lastNightNotice?: "day" | "night";
+  private stuck = 0;
+  private lastPos = { x: 0, y: 0, z: 0 };
+  private lastErrand = 0;
+  private lastTorch = 0;
+  private failures = 0;
+  private lastPlanAt = 0;
+  private planGeneration = 0;
+  private workToken = 0;
+  private decisionToken = 0;
+  private nextDecisionAt = 0;
+  private holding?: Offer;
+  private deciding = false;
+  private refreshing = false;
+  private noUseful = false;
+  private assist: Assist = { kind: "follow" };
+  private childOverride = "";
+  private gathering = false;
+  private pickupRequested = false;
+  private pickupSince = 0;
+  private sawDrop = false;
+  private judgedStep = -1;
+  private lastDodgeSay = 0;
+  private recent: RecentAction[] = [];
+  private readonly cooled = new Map<string, number>();
+  private timer?: NodeJS.Timeout;
+  private readonly partner = new Partner();
+
+  constructor(
+    private readonly bot: Bot,
+    private readonly skills: Skills,
+  ) {}
+
+  start(): void {
+    this.partner.bind(this.bot, this.childName());
+    this.skills.watchDodge(() => this.sparring());
+    this.skills.watchChildDrops(() => this.childName());
+    this.timer = setInterval(() => void this.tick(), TICK_MS);
+  }
+
+  stopLoop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    this.pending?.resolve("我掉线了，正在重新连接。");
+    this.pending = undefined;
+    this.active?.resolve("我掉线了，正在重新连接。");
+    this.active = undefined;
+    try {
+      this.skills.stop();
+    } catch (error) {
+      console.warn("停止动作失败：", error);
+    }
+  }
+
+  focus(playerName: string): void {
+    if (playerName) this.childOverride = playerName;
+  }
+
+  instruct(text: string, playerName: string): Promise<string> {
+    return new Promise((resolve) => {
+      this.planGeneration += 1;
+      const working = Boolean(this.mission || this.busy || (this.holding && this.holding.key !== "follow"));
+      this.cutOff();
+      if (working) this.say("好，先停下来听新的。", true);
+      const replaced = "好，我改听新的。";
+      this.pending?.resolve(replaced);
+      this.active?.resolve(replaced);
+      this.active = undefined;
+      this.pending = { text, playerName, resolve };
+      void this.flushPlan();
+    });
+  }
+
+  private cutOff(): void {
+    this.workToken += 1;
+    this.decisionToken += 1;
+    this.skills.stop();
+    this.skills.clearBuild();
+    this.mission = undefined;
+    this.holding = undefined;
+    this.nextDecisionAt = 0;
+    this.stayPut = false;
+    this.stuck = 0;
+    this.busy = false;
+    this.deciding = false;
+    this.failures = 0;
+    this.gathering = false;
+    this.pickupRequested = false;
+    this.sawDrop = false;
+    this.judgedStep = -1;
+  }
+
+  private onTask(): boolean {
+    return Boolean(this.mission && this.mission.mode !== "follow" && this.mission.mode !== "stop");
+  }
+
+  private longTask(): boolean {
+    if (!this.mission || this.mission.mode !== "focused") return false;
+    return this.mission.steps.length > 1 || this.mission.steps.some((step) => step.type.toLowerCase() === "build");
+  }
+
+  private stepOffer(step: Mission["steps"][number]): Offer {
+    return {
+      key: `mission:${step.type}:${step.block ?? step.entity ?? step.template ?? step.item ?? "go"}`,
+      description: `Execute the current planned step「${this.mission?.title ?? "task"}」: ${step.label ?? step.type}. Do not follow the child.`,
+      intent: step,
+      sustain: false,
+    };
+  }
+
+  private taskSteps(blueprint: MissionBlueprint): MissionBlueprint["steps"] {
+    if (blueprint.mode === "follow") return blueprint.steps;
+    const work = blueprint.steps.filter((step) => {
+      const type = step.type.toLowerCase();
+      return type !== "follow" && type !== "come";
+    });
+    return work.length ? work : blueprint.steps;
+  }
+
+  private childName(): string {
+    return config.companionPlayer || this.childOverride;
+  }
+
+  private sparring(): boolean {
+    const step = this.mission?.steps[this.mission.stepIndex];
+    const entity = step?.entity ?? this.holding?.intent.entity;
+    return entity === "player" || entity === "child";
+  }
+
+  private noteDodge(kind: "flee" | "strafe"): void {
+    if (Date.now() - this.lastDodgeSay < 6_000) return;
+    this.lastDodgeSay = Date.now();
+    this.say(kind === "flee" ? "我先躲开。" : "我躲开了。", true);
+  }
+
+  private snapshot(): WorldState {
+    return { ...getWorldState(this.bot, this.childName(), this.mission), recent: this.recent.slice(-5) };
+  }
+
+  private async flushPlan(): Promise<void> {
+    if (this.planning || !this.pending) return;
+    this.planning = true;
+    const current = this.pending;
+    this.pending = undefined;
+    this.active = current;
+    try {
+      const message = await this.adopt(current.text, current.playerName);
+      if (this.active === current) current.resolve(message);
+    } catch (error) {
+      console.error("规划任务失败：", error);
+      if (this.active === current) current.resolve("我现在有点乱，请再说一次。");
+    } finally {
+      if (this.active === current) this.active = undefined;
+      this.planning = false;
+      if (this.pending) void this.flushPlan();
+    }
+  }
+
+  private async adopt(text: string, playerName: string): Promise<string> {
+    const generation = this.planGeneration;
+    this.lastPlanAt = Date.now();
+    this.failures = 0;
+    const state = this.snapshot();
+    const plan = await planMission(text, state);
+    if (generation !== this.planGeneration) return plan.reply;
+    if (plan.skill === "tp") return this.teleportNow(playerName, state, generation, plan.reply);
+    if (plan.skill === "gamemode") return this.changeModeNow(playerName, plan, generation);
+    if (plan.skill === "pickup") return this.pickupNow(playerName, generation);
+    if (plan.skill === "door") return this.openDoorNow(generation);
+    let chosen = await chooseMission(plan, state);
+    if (generation !== this.planGeneration) return plan.reply;
+    if ((chosen === "protect" || chosen === "stop") && plan.skill !== "protect" && plan.skill !== "stop" && plan.skill !== "clarify") {
+      const danger = state.health <= 6 && state.hostiles.some((hostile) => hostile.distance < 12);
+      if (!danger) chosen = plan.skill;
+    }
+    this.skills.stop();
+    this.stuck = 0;
+    this.holding = undefined;
+    if (chosen === "status") {
+      const message = this.skills.status(state);
+      this.say(message, true);
+      return message;
+    }
+    if (chosen === "clarify") {
+      this.say(plan.reply, true);
+      return plan.reply;
+    }
+    if (chosen === "stop") {
+      this.mission = undefined;
+      this.stayPut = true;
+      this.say(plan.reply, true);
+      return plan.reply;
+    }
+    this.stayPut = false;
+    const blueprint = plan.missions[chosen] ?? fallbackBlueprint(chosen, plan);
+    this.mission = this.createMission(chosen, plan.reply, blueprint);
+    if (this.longTask()) {
+      const steps = this.mission.steps.map((step) => step.label ?? step.type).join(" → ");
+      console.log(`长任务「${this.mission.title}」：${steps}`);
+    }
+    const message = buildReply(this.mission.steps, plan.reply);
+    this.say(message, true);
+    return message;
+  }
+
+  private async openDoorNow(generation: number): Promise<string> {
+    const opened = await this.skills.openDoorAhead(true);
+    if (generation !== this.planGeneration) return opened ? "门开了。" : "面前没有关上的门。";
+    const message = opened ? "门开了。" : "面前没有关上的门。";
+    this.say(message, true);
+    return message;
+  }
+
+  private async teleportNow(playerName: string, state: WorldState, generation: number, reply: string): Promise<string> {
+    this.skills.stop();
+    this.mission = undefined;
+    this.holding = undefined;
+    this.stayPut = false;
+    this.stuck = 0;
+    const result = await this.skills.progress({ type: "tp", label: "传送" }, playerName, state);
+    if (generation !== this.planGeneration) return result.message ?? reply;
+    const message = result.message ?? reply;
+    this.say(message, true);
+    return message;
+  }
+
+  private changeModeNow(playerName: string, plan: Plan, generation: number): string {
+    this.skills.stop();
+    this.mission = undefined;
+    this.holding = undefined;
+    this.stayPut = false;
+    if (generation !== this.planGeneration) return plan.reply;
+    const result = this.skills.changeGameMode(plan.item ?? "", playerName, plan.entity === "child");
+    const message = result.message ?? plan.reply;
+    this.say(message, true);
+    return message;
+  }
+
+  private pickupNow(playerName: string, generation: number): string {
+    this.skills.stop();
+    this.mission = undefined;
+    this.holding = undefined;
+    this.stayPut = false;
+    this.stuck = 0;
+    if (generation !== this.planGeneration) return "好，我去捡你掉的东西。";
+    const child = this.bot.players[playerName]?.entity;
+    this.skills.claimNearbyDrops(playerName);
+    const hasDrop = this.skills.hasChildDrop(playerName);
+    const nearby = Boolean(child && child.position.distanceTo(this.bot.entity.position) <= 6);
+    const message = !child && !hasDrop
+      ? "我现在看不到你，靠近一点再让我捡。"
+      : nearby && !hasDrop
+        ? "你身边没有掉落的东西。"
+        : "好，我去捡你掉的东西。";
+    if (message.startsWith("好")) {
+      this.pickupRequested = true;
+      this.gathering = true;
+      this.sawDrop = hasDrop;
+      this.pickupSince = Date.now();
+    }
+    this.say(message, true);
+    return message;
+  }
+
+  private gatherDrops(playerName: string): boolean {
+    if (!this.pickupRequested) return false;
+    this.skills.claimNearbyDrops(playerName);
+    const hasDrop = this.skills.hasChildDrop(playerName);
+    if (hasDrop) this.sawDrop = true;
+    if (!hasDrop) {
+      if (!this.sawDrop && this.shouldSearchDrops(playerName)) {
+        this.skills.keepFollow(playerName, 2);
+        return true;
+      }
+      this.finishPickup(this.sawDrop ? "我捡到了。" : "你身边没有掉落的东西。");
+      return false;
+    }
+    const result = this.skills.pickupChildDrop(playerName);
+    if (result.status === "blocked") this.finishPickup(result.message ?? "我现在捡不了。");
+    return true;
+  }
+
+  private shouldSearchDrops(playerName: string): boolean {
+    if (Date.now() - this.pickupSince > 20_000) return false;
+    const child = this.bot.players[playerName]?.entity;
+    if (!child) return false;
+    return child.position.distanceTo(this.bot.entity.position) > 6;
+  }
+
+  private finishPickup(message: string): void {
+    const wasGathering = this.gathering;
+    this.gathering = false;
+    this.pickupRequested = false;
+    this.sawDrop = false;
+    this.skills.stop();
+    if (message && wasGathering) this.say(message, true);
+  }
+
+  private createMission(id: string, reply: string, blueprint: MissionBlueprint): Mission {
+    const now = Date.now();
+    const steps = prepareTaskSteps(this.taskSteps(blueprint), this.skills.itemCounts());
+    const first = steps[0];
+    return {
+      id,
+      title: blueprint.title ?? reply.slice(0, 18),
+      reply,
+      mode: blueprint.mode,
+      steps,
+      stepIndex: 0,
+      startedAt: now,
+      lastProgressAt: now,
+      baseCount: this.stepBaseCount(first),
+    };
+  }
+
+  private async tick(): Promise<void> {
+    if (!this.bot.entity) return;
+    const dodge = this.skills.dodgeState();
+    if (dodge) {
+      this.noteDodge(dodge);
+      return;
+    }
+    void this.skills.openDoorAhead();
+    const playerName = this.childName();
+    if (!playerName) return;
+    const state = this.snapshot();
+
+    if (await this.handleEmergency(state, playerName)) return;
+    if (this.planning) return;
+    this.noticeNight(state);
+    this.queueBackgroundPlan(state);
+    if (this.busy) return;
+    if (await this.maybeEat()) return;
+    if (this.gatherDrops(playerName)) return;
+    if (this.mission && Date.now() - this.mission.startedAt > MISSION_LIMIT_MS) {
+      this.say("这件事变久了，我先回到你身边。", true);
+      this.mission = undefined;
+      this.holding = undefined;
+      this.skills.stop();
+      this.skills.keepFollow(playerName, 4);
+      return;
+    }
+    if (this.onTask() && this.holding?.key === "follow") {
+      this.holding = undefined;
+      this.skills.stop();
+    }
+    if (this.holding?.sustain && Date.now() < this.nextDecisionAt && !(this.onTask() && this.holding.key === "follow")) {
+      await this.runOffer(this.holding, playerName, state, true);
+      return;
+    }
+    if (this.deciding) return;
+    if (this.stayPut && !this.mission) return;
+    await this.decide(playerName, state);
+  }
+
+  private queueBackgroundPlan(state: WorldState): void {
+    const reason = planTrigger({
+      hasMission: this.mission?.mode === "focused",
+      failures: this.failures,
+      now: Date.now(),
+      lastPlanAt: this.lastPlanAt,
+      noUseful: this.noUseful,
+    });
+    if (!reason || this.planning || this.refreshing || !this.mission) return;
+    const generation = this.planGeneration;
+    const missionId = this.mission.id;
+    const title = this.mission.title;
+    this.refreshing = true;
+    this.lastPlanAt = Date.now();
+    const note = `继续任务「${title}」。更新原因：${reason}。最近动作：${this.recent.map((item) => `${item.action}=${item.result}`).join("；") || "无"}。`;
+    void planMission(note, state)
+      .then((plan) => {
+        if (generation !== this.planGeneration || this.mission?.id !== missionId) {
+          console.log(`丢弃过期计划（${reason}）`);
+          return;
+        }
+        const blueprint = plan.missions.do ?? plan.missions[plan.skill];
+        if (!blueprint?.steps.length || plan.skill === "clarify" || plan.skill === "stop") return;
+        const steps = prepareTaskSteps(this.taskSteps(blueprint), this.skills.itemCounts());
+        this.mission.steps = steps;
+        this.mission.stepIndex = 0;
+        this.mission.mode = blueprint.mode;
+        this.mission.title = blueprint.title ?? this.mission.title;
+        this.mission.baseCount = this.stepBaseCount(steps[0]);
+        this.failures = 0;
+        this.holding = undefined;
+        this.judgedStep = -1;
+        this.nextDecisionAt = 0;
+        console.log(`后台更新计划（${reason}）：${this.mission.title}`);
+      })
+      .catch((error: unknown) => console.error("后台规划失败：", error))
+      .finally(() => {
+        this.refreshing = false;
+      });
+  }
+
+  private async decide(playerName: string, state: WorldState): Promise<void> {
+    const generation = this.planGeneration;
+    const token = ++this.decisionToken;
+    this.deciding = true;
+    this.nextDecisionAt = Date.now() + DECISION_MS;
+    try {
+      const step = this.mission?.steps[this.mission.stepIndex];
+      if (this.onTask()) {
+        if (!step || !this.mission) {
+          this.finish(playerName, "做完了，我回来找你。");
+          return;
+        }
+        const offer = this.stepOffer(step);
+        if (this.longTask() && this.judgedStep !== this.mission.stepIndex) {
+          const judged = await judgePlannedStep(offer, state, {
+            title: this.mission.title,
+            index: this.mission.stepIndex,
+            steps: this.mission.steps.map((item) => item.label ?? item.type),
+          });
+          if (generation !== this.planGeneration || token !== this.decisionToken) return;
+          this.judgedStep = this.mission.stepIndex;
+          this.holding = judged;
+        } else {
+          this.holding = this.holding?.key === offer.key ? this.holding : offer;
+        }
+        if (!offer.sustain) this.nextDecisionAt = 0;
+        await this.runOffer(this.holding ?? offer, playerName, state, false);
+        return;
+      }
+      this.assist = this.stayPut
+        ? { kind: "follow" }
+        : this.partner.decide(this.bot, playerName, {
+            canErrand: !this.mission && Date.now() - this.lastErrand > ERRAND_GAP_MS && state.time === "day" && state.hostiles.length === 0 && (state.childDistance ?? 99) < 12,
+            canLight: state.time === "night" && Date.now() - this.lastTorch > TORCH_GAP_MS,
+          });
+      if (this.mission && !step) {
+        this.finish(playerName, "做完了，我回来找你。");
+        return;
+      }
+      const offers = filterOffers(buildOffers({
+        stayPut: this.stayPut,
+        childVisible: state.childVisible,
+        night: state.time === "night",
+        defense: state.hostiles.length > 0 || this.mission?.mode === "guard",
+        mission: this.mission && step ? { mode: this.mission.mode, title: this.mission.title, step } : undefined,
+        mining: this.assist.kind === "mine" ? { block: this.assist.block, label: this.assist.label } : undefined,
+        errand: this.assist.kind === "errand" ? { block: this.assist.block, label: this.assist.label } : undefined,
+        canLight: this.assist.kind === "light",
+        canSleep: state.time === "night"
+          && !this.stayPut
+          && (!this.mission || this.mission.mode === "follow" || this.mission.mode === "idle")
+          && this.skills.bedNearby(),
+      }), { unsafe: false, cooled: this.cooledKeys() });
+      this.noUseful = offers.every((offer) => offer.key === "wait");
+      if (this.noUseful) {
+        this.failures += 1;
+        if (!this.mission || this.mission.mode === "follow") this.skills.keepFollow(playerName, 3);
+        return;
+      }
+      const offer = await chooseOffer(offers, state);
+      if (generation !== this.planGeneration || token !== this.decisionToken) return;
+      console.log(`选择 ${offer.key}：${offer.description}`);
+      this.holding = offer;
+      if (!offer.sustain) this.nextDecisionAt = 0;
+      await this.runOffer(offer, playerName, state, false);
+    } finally {
+      if (token === this.decisionToken) this.deciding = false;
+    }
+  }
+
+  private async handleEmergency(state: WorldState, playerName: string): Promise<boolean> {
+    const child = this.bot.players[playerName]?.entity;
+    const threatNearChild = child ? this.skills.threatNear(child.position, 8) : undefined;
+    const closeHostile = Boolean(threatNearChild)
+      || state.hostiles.some((hostile) => hostile.distance < 10)
+      || (this.skills.nearestHostileDistance() ?? 99) < 10;
+    const childInDanger = Boolean(threatNearChild || (state.childVisible && state.childDistance !== undefined && state.childDistance < 16 && closeHostile));
+    const selfInDanger = state.health <= 6 && closeHostile;
+    if (childInDanger || selfInDanger) {
+      if (!this.emergency) {
+        this.skills.stop();
+        this.emergency = true;
+        const helping = Boolean(threatNearChild && threatNearChild.name !== "creeper");
+        this.say(helping ? "我过来帮你打。" : "小心，我来挡住。", true);
+      }
+      if (this.busy) return true;
+      if (threatNearChild && threatNearChild.name !== "creeper") {
+        const name = threatNearChild.name;
+        await this.withWork(async () => {
+          await this.skills.progress({ type: "attack", entity: name, label: name }, playerName, state);
+        });
+      } else {
+        this.skills.protectOnce(playerName, !this.onTask());
+      }
+      return true;
+    }
+    if (this.emergency) {
+      this.emergency = false;
+      this.say("安全了。", true);
+    }
+    return false;
+  }
+
+  private async maybeEat(): Promise<boolean> {
+    if (this.bot.food > 10 || Date.now() - this.lastEat < 20_000) return false;
+    this.lastEat = Date.now();
+    return this.skills.eatIfHungry();
+  }
+
+  private noticeNight(state: WorldState): void {
+    if (this.lastNightNotice === state.time) return;
+    this.lastNightNotice = state.time;
+    if (state.time === "night" && !this.mission) this.say("天黑了，我挨着你。");
+  }
+
+  private async runOffer(offer: Offer, playerName: string, state: WorldState, quiet: boolean): Promise<void> {
+    const generation = this.planGeneration;
+    const token = this.workToken;
+    const current = (): boolean => this.fresh(generation, token);
+    const key = offer.key;
+    if (key === "follow") {
+      this.skills.keepFollow(playerName, state.time === "night" ? 2 : 4);
+      return;
+    }
+    if (key === "stop" || key === "wait") {
+      if (key === "stop") this.skills.stop();
+      return;
+    }
+    if (key === "protect" || key === "retreat") {
+      this.skills.protectOnce(playerName);
+      return;
+    }
+    if (key === "sleep") {
+      await this.withWork(async () => {
+        const result = await this.skills.progress({ type: "sleep", label: "睡觉" }, playerName, state);
+        if (!current()) return;
+        this.noteResult(key, result, quiet);
+        if (result.status !== "progress") {
+          this.holding = undefined;
+          this.nextDecisionAt = 0;
+        }
+      });
+      return;
+    }
+    if (key === "sit" || offer.intent.type === "sit") {
+      if (state.childVisible && (state.childDistance ?? 0) > 8) {
+        this.skills.keepFollow(playerName, 3);
+        return;
+      }
+      const result = await this.skills.progress({ type: "sit" }, playerName, state);
+      if (!current()) return;
+      this.skills.keepSit(playerName);
+      this.noteResult(key, result, quiet);
+      return;
+    }
+    if (key === "light") {
+      this.lastTorch = Date.now();
+      await this.withWork(async () => {
+        const result = await this.skills.lightNear(playerName);
+        if (!current()) return;
+        this.noteResult(key, result, quiet);
+      });
+      return;
+    }
+    if (key.startsWith("mine:") || key.startsWith("errand:")) {
+      if (key.startsWith("errand:")) this.lastErrand = Date.now();
+      if (!quiet) this.say(key.startsWith("mine:") ? `我来帮你挖${offer.intent.label ?? "这个"}。` : `我去旁边拿点${offer.intent.label ?? "东西"}，马上回来。`);
+      await this.withWork(async () => {
+        const result = await this.skills.helpGather(
+          offer.intent.block ?? "",
+          playerName,
+          key.startsWith("mine:") ? 10 : 14,
+          this.assist.kind === "mine" ? this.assist.avoid : undefined,
+        );
+        if (!current()) return;
+        this.noteResult(key, result, quiet);
+      });
+      if (!current()) return;
+      this.nextDecisionAt = 0;
+      return;
+    }
+    if (!this.mission || !key.startsWith("mission:")) return;
+    if (this.isStuck() && !this.sticky(offer) && offer.intent.type.toLowerCase() !== "build") {
+      this.stuck = 0;
+      this.failures += 1;
+      this.cooled.set(key, Date.now() + failureCooldown(key));
+      this.remember(key, "卡住");
+      this.say("我卡住了，换个办法。");
+      this.nextStep(playerName, state);
+      return;
+    }
+    if (this.stepComplete(offer.intent, this.mission)) {
+      this.nextStep(playerName, state);
+      return;
+    }
+    await this.withWork(async () => {
+      const result = await this.skills.progress(offer.intent, playerName, state);
+      if (!current()) return;
+      this.trackProgress();
+      this.noteResult(key, result, quiet);
+      if (this.sticky(offer) || !this.mission) return;
+      if (offer.intent.type.toLowerCase() === "sleep" || offer.intent.type.toLowerCase() === "craft" || offer.intent.type.toLowerCase() === "deposit" || offer.intent.type.toLowerCase() === "withdraw") {
+        if (result.status === "done") this.nextStep(playerName, state);
+        if (result.status === "blocked") {
+          this.holding = undefined;
+          this.nextDecisionAt = 0;
+          if (offer.intent.type.toLowerCase() !== "sleep") {
+            this.mission = undefined;
+            this.skills.stop();
+          }
+        }
+        return;
+      }
+      if (result.status === "blocked" || result.status === "done" || this.stepComplete(offer.intent, this.mission)) {
+        this.nextStep(playerName, state);
+      }
+    });
+  }
+
+  private fresh(generation: number, token: number): boolean {
+    return generation === this.planGeneration && token === this.workToken;
+  }
+
+  private sticky(offer: Offer): boolean {
+    return ["sit", "attack", "hunt", "protect", "follow", "retreat"].includes(offer.intent.type.toLowerCase());
+  }
+
+  private async withWork(work: () => Promise<void>): Promise<void> {
+    const token = this.workToken;
+    this.busy = true;
+    try {
+      await work();
+    } finally {
+      if (token === this.workToken) this.busy = false;
+    }
+  }
+
+  private noteResult(key: string, result: StepResult, quiet: boolean): void {
+    this.remember(key, result.message ?? result.status);
+    if (!quiet && result.message) this.say(result.message);
+    if (result.status === "blocked") {
+      this.failures += 1;
+      this.cooled.set(key, Date.now() + failureCooldown(key));
+      return;
+    }
+    if (result.status === "done") this.failures = 0;
+  }
+
+  private remember(action: string, result: string): void {
+    this.recent.push({ action, result });
+    if (this.recent.length > 5) this.recent.shift();
+  }
+
+  private cooledKeys(): Set<string> {
+    const now = Date.now();
+    for (const [key, until] of this.cooled) {
+      if (until <= now) this.cooled.delete(key);
+    }
+    return new Set(this.cooled.keys());
+  }
+
+  private stepComplete(step: { type: string; block?: string; item?: string; count?: number }, mission: Mission): boolean {
+    const type = step.type.toLowerCase();
+    if (type !== "collect" && type !== "mine" && type !== "harvest") return false;
+    const names = this.skills.resolveBlocks(step.block ?? step.item);
+    const got = this.skills.countItems(names) - mission.baseCount;
+    return got >= (step.count ?? 1);
+  }
+
+  private nextStep(playerName: string, state: WorldState): void {
+    if (!this.mission) return;
+    this.mission.stepIndex += 1;
+    this.holding = undefined;
+    this.nextDecisionAt = 0;
+    const next = this.mission.steps[this.mission.stepIndex];
+    if (!next) {
+      this.finish(playerName, "做完了，我回来找你。");
+      return;
+    }
+    this.mission.baseCount = this.stepBaseCount(next);
+    this.mission.lastProgressAt = Date.now();
+    this.stuck = 0;
+    this.say(`下一步：${next.label ?? next.type}。`);
+  }
+
+  private finish(playerName: string, message: string): void {
+    this.mission = undefined;
+    this.holding = undefined;
+    this.stayPut = false;
+    this.say(message, true);
+    this.skills.stop();
+    this.skills.clearBuild();
+    this.skills.keepFollow(playerName, 3);
+  }
+
+  private stepBaseCount(step?: { type: string; block?: string; item?: string }): number {
+    if (!step) return 0;
+    const type = step.type.toLowerCase();
+    if (type !== "collect" && type !== "mine" && type !== "harvest") return 0;
+    return this.skills.countItems(this.skills.resolveBlocks(step.block ?? step.item));
+  }
+
+  private isStuck(): boolean {
+    const pos = this.bot.entity.position.floored();
+    if (pos.x === this.lastPos.x && pos.y === this.lastPos.y && pos.z === this.lastPos.z) this.stuck += 1;
+    else this.stuck = 0;
+    this.lastPos = { x: pos.x, y: pos.y, z: pos.z };
+    return this.stuck >= STUCK_TICKS;
+  }
+
+  private trackProgress(): void {
+    if (this.mission) this.mission.lastProgressAt = Date.now();
+  }
+
+  private say(message: string, important = false): void {
+    if (!message) return;
+    const now = Date.now();
+    if (!important && now - this.lastChat < CHAT_GAP_MS) return;
+    this.lastChat = now;
+    this.bot.chat(message);
+  }
+}
+
+function fallbackBlueprint(id: string, plan: Plan): MissionBlueprint {
+  if (id === "protect") return { mode: "guard", title: "保护", steps: [{ type: "protect" }] };
+  if (id === "follow") return { mode: "follow", title: "跟随", steps: [{ type: "follow" }] };
+  if (id === "sit") return { mode: "sit", title: "坐下", steps: [{ type: "come" }, { type: "sit" }] };
+  if (id === "sleep") return { mode: "sleep", title: "睡觉", steps: [{ type: "sleep", label: "睡觉" }] };
+  if (id === "tp" || id === "teleport") return { mode: "focused", title: "传送", steps: [{ type: "tp", label: "传送" }] };
+  if (id === "craft") return { mode: "focused", title: plan.item ? craftLabel(plan.item) : "制作", steps: [{ type: "craft", item: plan.item, label: plan.item ? craftLabel(plan.item) : "制作" }] };
+  if (id === "store" && plan.store) return { mode: "focused", title: plan.store === "deposit" ? "放进箱子" : "从箱子拿", steps: [{ type: plan.store, item: plan.item }] };
+  if (id === "attack" || id === "hunt") return { mode: "hunt", title: "进攻", steps: [{ type: "attack", entity: plan.entity, label: plan.entity }] };
+  if (id === "stop") return { mode: "stop", title: "停下", steps: [{ type: "stop" }] };
+  return plan.missions[plan.skill] ?? { mode: "idle", steps: [{ type: "follow" }] };
+}

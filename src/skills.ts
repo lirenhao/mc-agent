@@ -1,8 +1,18 @@
+import type { Chest } from "mineflayer";
+import type { Block } from "prismarine-block";
 import type { Bot } from "mineflayer";
 import "mineflayer-collectblock";
 import pathfinderModule from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
-import type { ActionIntent, BuildTemplate, Task, WorldState } from "./types.js";
+import { isCraftItem, nextCraftAction } from "./craft.js";
+import { storageNames } from "./storage.js";
+import { chooseHarvestTool } from "./tools.js";
+import { ChildDrops, DROP_CLAIM_RADIUS, DROP_GIVE_UP_MS } from "./drops.js";
+import { controlsFor, isClosing, pickDodge, strafeOf, unitAway, type DodgeKind } from "./dodge.js";
+import { doorIsClosed, isToggleDoor } from "./doors.js";
+import { isHostileEntity } from "./mobs.js";
+import { templateBlocks } from "./materials.js";
+import type { ActionIntent, StepResult, WorldState } from "./types.js";
 
 const { goals, Movements } = pathfinderModule;
 
@@ -13,292 +23,363 @@ const resourceBlocks: Record<string, string[]> = {
   iron: ["iron_ore", "deepslate_iron_ore"],
 };
 
-const templateBlocks: Record<string, Array<{ dx: number; dy: number; dz: number; names: string[] }>> = {
-  cabin: [
-    { dx: 0, dy: 0, dz: 0, names: ["oak_planks", "spruce_planks"] }, { dx: 1, dy: 0, dz: 0, names: ["oak_planks", "spruce_planks"] },
-    { dx: 0, dy: 0, dz: 1, names: ["oak_planks", "spruce_planks"] }, { dx: 1, dy: 0, dz: 1, names: ["oak_planks", "spruce_planks"] },
-    { dx: 0, dy: 1, dz: 0, names: ["oak_log", "spruce_log"] }, { dx: 1, dy: 1, dz: 0, names: ["oak_log", "spruce_log"] },
-    { dx: 0, dy: 1, dz: 1, names: ["oak_log", "spruce_log"] }, { dx: 1, dy: 1, dz: 1, names: ["oak_log", "spruce_log"] },
-  ],
-  farm: [
-    { dx: 0, dy: 0, dz: 0, names: ["oak_fence", "spruce_fence"] }, { dx: 1, dy: 0, dz: 0, names: ["oak_fence", "spruce_fence"] },
-    { dx: 2, dy: 0, dz: 0, names: ["oak_fence", "spruce_fence"] }, { dx: 0, dy: 0, dz: 1, names: ["oak_fence", "spruce_fence"] },
-    { dx: 2, dy: 0, dz: 1, names: ["oak_fence", "spruce_fence"] }, { dx: 0, dy: 0, dz: 2, names: ["oak_fence", "spruce_fence"] },
-    { dx: 1, dy: 0, dz: 2, names: ["oak_fence", "spruce_fence"] }, { dx: 2, dy: 0, dz: 2, names: ["oak_fence", "spruce_fence"] },
-  ],
-  camp: [
-    { dx: 0, dy: 0, dz: 0, names: ["campfire"] }, { dx: -1, dy: 0, dz: 0, names: ["oak_log", "spruce_log"] },
-    { dx: 1, dy: 0, dz: 0, names: ["oak_log", "spruce_log"] }, { dx: 0, dy: 0, dz: -1, names: ["oak_log", "spruce_log"] },
-    { dx: 0, dy: 0, dz: 1, names: ["oak_log", "spruce_log"] },
-  ],
-};
-
 const neverAttack = new Set(["player", "villager", "wandering_trader", "iron_golem", "snow_golem", "cat", "wolf", "allay", "parrot"]);
+const projectiles = new Set(["arrow", "spectral_arrow", "trident", "small_fireball", "fireball", "large_fireball", "wither_skull", "shulker_bullet", "dragon_fireball", "wind_charge"]);
 
-export class SkillController {
-  private protectionTimer?: NodeJS.Timeout;
+export class Skills {
+  private buildCursor?: {
+    origin: Vec3;
+    index: number;
+    tries: number;
+    pending: number[];
+    plan: Array<{ dx: number; dy: number; dz: number; names: string[] }>;
+  };
+  private readonly drops = new ChildDrops();
+  private readonly skippedBlocks = new Map<string, number>();
+  private walkMoves?: InstanceType<typeof Movements>;
+  private digMoves?: InstanceType<typeof Movements>;
+  private readonly doorOpenedAt = new Map<string, number>();
+  private watchingDrops = false;
+  private dodgeWatching = false;
+  private sparring: () => boolean = () => false;
+  private dodging = false;
+  private dodgeKind?: DodgeKind;
+  private dodgeUntil = 0;
+  private dodgeSide: 1 | -1 = 1;
+  private dodgeAnchor = { x: 0, z: 0, at: 0 };
+  private stuckDodge = false;
+  private previousHealth = 20;
+  private lastSwing = 0;
+  private lastDodgeError = 0;
 
   constructor(private readonly bot: Bot) {}
 
+  watchDodge(sparring: () => boolean): void {
+    this.sparring = sparring;
+    if (this.dodgeWatching) return;
+    this.dodgeWatching = true;
+    this.bot.on("physicsTick", () => {
+      try {
+        if (!this.bot.entity) return;
+        this.dodgeIncoming();
+      } catch (error) {
+        if (Date.now() - this.lastDodgeError > 5_000) {
+          this.lastDodgeError = Date.now();
+          console.warn(`躲避失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    });
+  }
+
+  dodgeState(): DodgeKind | undefined {
+    if (!this.dodging && Date.now() >= this.dodgeUntil) return undefined;
+    return this.dodgeKind;
+  }
+
+  private dodgeIncoming(): DodgeKind | undefined {
+    const here = this.bot.entity.position;
+    const health = this.bot.health;
+    const justHurt = health < this.previousHealth - 0.05;
+    this.previousHealth = health;
+    const candidates = [];
+    const entities = [];
+    for (const entity of Object.values(this.bot.entities)) {
+      if (!entity?.name || entity === this.bot.entity) continue;
+      const distance = entity.position.distanceTo(here);
+      if (distance > 16) continue;
+      const projectile = projectiles.has(entity.name);
+      const player = entity.type === "player" || entity.name === "player";
+      const hostile = isHostileEntity(entity);
+      if (!projectile && !player && !hostile) continue;
+      const velocity = entity.velocity;
+      candidates.push({
+        name: entity.name,
+        x: entity.position.x,
+        z: entity.position.z,
+        distance,
+        hostile,
+        projectile,
+        player,
+        closing: projectile && velocity ? isClosing(entity.position, velocity, here) : false,
+      });
+      entities.push(entity);
+    }
+    const choice = pickDodge({ health, justHurt, sparring: this.sparring(), candidates });
+    if (!choice) {
+      if (Date.now() < this.dodgeUntil) return this.dodgeKind;
+      if (this.dodging) {
+        this.bot.clearControlStates();
+        this.dodging = false;
+      }
+      return undefined;
+    }
+    const threat = entities[choice.index];
+    const candidate = candidates[choice.index];
+    this.bot.pathfinder.setGoal(null);
+    if (!this.dodging) {
+      this.releaseForDodge();
+      if (choice.kind === "strafe") void this.equipWeapon();
+    }
+    this.dodging = true;
+    this.dodgeKind = choice.kind;
+    this.dodgeUntil = Date.now() + 450;
+    const away = unitAway(here, candidate) ?? { x: 1, z: 0 };
+    const now = Date.now();
+    if (now - this.dodgeAnchor.at > 500) {
+      const moved = Math.hypot(here.x - this.dodgeAnchor.x, here.z - this.dodgeAnchor.z);
+      this.stuckDodge = this.dodgeAnchor.at > 0 && moved < 0.35;
+      this.dodgeAnchor = { x: here.x, z: here.z, at: now };
+      if (this.stuckDodge) this.dodgeSide = this.dodgeSide === 1 ? -1 : 1;
+    }
+    const dir = choice.kind === "strafe" || this.stuckDodge ? strafeOf(away, this.dodgeSide) : away;
+    const controls = controlsFor(this.bot.entity.yaw, dir);
+    this.bot.setControlState("forward", controls.forward);
+    this.bot.setControlState("back", controls.back);
+    this.bot.setControlState("left", controls.left);
+    this.bot.setControlState("right", controls.right);
+    this.bot.setControlState("sprint", true);
+    this.bot.setControlState("sneak", false);
+    this.bot.setControlState("jump", choice.kind === "flee" || this.stuckDodge || justHurt || candidate.projectile);
+    if (choice.kind === "strafe" && threat && this.canSwing(threat) && now - this.lastSwing > 500) {
+      this.lastSwing = now;
+      void this.bot.lookAt(threat.position.offset(0, (threat.height ?? 1.6) * 0.7, 0), true);
+      this.bot.attack(threat);
+    }
+    return choice.kind;
+  }
+
+  private canSwing(entity: { name?: string; type?: string }): boolean {
+    if (!entity.name || entity.name === "creeper" || projectiles.has(entity.name)) return false;
+    if (entity.type === "player" || entity.name === "player") return this.sparring();
+    if (neverAttack.has(entity.name)) return false;
+    return isHostileEntity(entity);
+  }
+
+  private releaseForDodge(): void {
+    if (this.bot.targetDigBlock) this.bot.stopDigging();
+    const opened = this.bot.currentWindow;
+    if (opened) void this.bot.closeWindow(opened).catch(() => undefined);
+    void this.bot.collectBlock?.cancelTask();
+    if (this.bot.isSleeping) void this.bot.wake().catch(() => undefined);
+    console.log("躲开攻击");
+  }
+
+  private fleeFrom(position: { x: number; z: number }): void {
+    const away = unitAway(this.bot.entity.position, position) ?? { x: 1, z: 0 };
+    const here = this.bot.entity.position;
+    this.useWalk();
+    this.bot.pathfinder.setGoal(new goals.GoalNear(here.x + away.x * 8, here.y, here.z + away.z * 8, 1));
+  }
+
+  watchChildDrops(childName: () => string): void {
+    if (this.watchingDrops) return;
+    this.watchingDrops = true;
+    this.bot.on("entitySpawn", (entity) => {
+      const child = this.bot.players[childName()]?.entity;
+      this.drops.notice(entity, child?.position);
+    });
+    this.bot.on("entityGone", (entity) => this.drops.forget(entity.id));
+    this.bot.on("playerCollect", (_collector, collected) => {
+      if (collected) this.drops.forget(collected.id);
+    });
+  }
+
+  ignoreOwnDrops(ms = 2_000): void {
+    this.drops.ignore(ms);
+  }
+
+  claimNearbyDrops(playerName: string, radius = DROP_CLAIM_RADIUS): number {
+    return this.drops.claim(this.dropWorld(), playerName, radius);
+  }
+
+  hasChildDrop(playerName: string): boolean {
+    return this.drops.has(this.dropWorld(), playerName);
+  }
+
+  pickupChildDrop(playerName: string): StepResult {
+    const world = this.dropWorld();
+    const drop = this.drops.next(world, playerName);
+    if (!drop) return { status: "done" };
+    if (!this.canHoldDrop(drop)) return { status: "blocked", message: "我背包满了，捡不了。" };
+    const here = this.bot.entity.position;
+    const distance = Math.hypot(drop.position.x - here.x, drop.position.y - here.y, drop.position.z - here.z);
+    if (distance > 2.5 && this.drops.attemptAge(drop.id) > DROP_GIVE_UP_MS) {
+      this.drops.forget(drop.id);
+      if (!this.drops.has(world, playerName)) return { status: "blocked", message: "我过不去那个东西。" };
+      return { status: "progress" };
+    }
+    this.bot.setControlState("sneak", false);
+    this.useWalk();
+    this.bot.pathfinder.setGoal(new goals.GoalNear(drop.position.x, drop.position.y, drop.position.z, 1), true);
+    return { status: "progress" };
+  }
+
+  private dropWorld() {
+    return { entity: this.bot.entity, entities: this.bot.entities, players: this.bot.players };
+  }
+
+  private canHoldDrop(entity: { getDroppedItem?: () => { type?: number; stackSize?: number } | null }): boolean {
+    if (this.bot.inventory.emptySlotCount() > 0) return true;
+    let dropped: { type?: number; stackSize?: number } | null = null;
+    try {
+      dropped = entity.getDroppedItem?.() ?? null;
+    } catch {
+      dropped = null;
+    }
+    if (!dropped?.type) return false;
+    return this.bot.inventory.items().some((slot) => slot.type === dropped.type && slot.count < (slot.stackSize ?? dropped.stackSize ?? 64));
+  }
+
   stop(): void {
+    if (this.bot.isSleeping) void this.bot.wake().catch(() => undefined);
+    const opened = this.bot.currentWindow;
+    if (opened) void this.bot.closeWindow(opened).catch(() => undefined);
     this.bot.pathfinder.setGoal(null);
     this.bot.clearControlStates();
-    this.stopProtection();
     void this.bot.collectBlock?.cancelTask();
   }
 
-  async run(action: string, playerName: string, task: Task, state: WorldState): Promise<string> {
-    const intent = task.intents[action] ?? { type: action, block: task.resource, template: task.template, label: task.reply };
-    return this.perform(intent, playerName, task, state);
+  clearBuild(): void {
+    this.buildCursor = undefined;
   }
 
-  private async perform(intent: ActionIntent, playerName: string, task: Task, state: WorldState): Promise<string> {
-    const type = intent.type.toLowerCase();
-    if (type === "clarify") return task.reply;
-    if (type === "stop") { this.stop(); return "好，我停在这里等你。"; }
-    if (type === "follow") return this.follow(playerName);
-    if (type === "protect") return this.protect(playerName);
-    if (type === "status") return this.status(state);
-    if (type === "find" || type === "find_resource") return this.find(intent);
-    if (type === "collect" || type === "mine" || type === "harvest") return this.collect(intent);
-    if (type === "attack" || type === "hunt") return this.attack(intent);
-    if (type === "build") return this.build(intent);
-    if (type === "place") return this.place(intent);
-    if (type === "give" || type === "toss") return this.give(intent, playerName);
-    if (type === "goto") return this.goto(intent, playerName);
-    if (type === "come") return this.come(playerName);
-    if (type === "explore") return this.explore();
-    if (type === "dance" || type === "jump" || type === "emote") return this.dance();
-    if (type === "eat") return this.eat();
-    if (type === "look") return this.look(playerName);
-    return this.fallback(intent, playerName);
-  }
-
-  private follow(playerName: string): string {
-    const player = this.bot.players[playerName];
-    if (!player?.entity) return "我现在看不到你，靠近我一点再试试。";
-    this.stopProtection();
-    this.bot.pathfinder.setMovements(new Movements(this.bot));
-    this.bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, 2), true);
-    return "好，我跟着你。";
-  }
-
-  private find(intent: ActionIntent): string {
-    this.stopProtection();
-    const names = this.resolveBlocks(intent.block);
-    const ids = names.map((name) => this.bot.registry.blocksByName[name]?.id).filter((id): id is number => id !== undefined);
-    const label = intent.label ?? intent.block ?? "那个";
-    const block = ids.length ? this.bot.findBlock({ matching: ids, maxDistance: 64 }) : null;
-    if (!block) {
-      this.walkAhead();
-      return `附近还没有发现${label}，我先带你往前探索。`;
-    }
-    this.bot.pathfinder.setGoal(new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2));
-    return `我发现${label}了，跟我来。`;
-  }
-
-  private async collect(intent: ActionIntent): Promise<string> {
-    this.stopProtection();
-    const names = this.resolveBlocks(intent.block);
-    const ids = names.map((name) => this.bot.registry.blocksByName[name]?.id).filter((id): id is number => id !== undefined);
-    const label = intent.label ?? intent.block ?? "这个";
-    if (!ids.length || !this.bot.collectBlock) {
-      return this.find(intent);
-    }
-    const count = intent.count ?? 3;
-    const blocks = this.bot.findBlocks({ matching: ids, maxDistance: 64, count });
-    if (!blocks.length) {
-      this.walkAhead();
-      return `附近没有${label}，我先往前找一找。`;
-    }
-    const targets = blocks.map((pos) => this.bot.blockAt(pos)).filter((block): block is NonNullable<typeof block> => Boolean(block));
+  async openDoorAhead(force = false): Promise<boolean> {
+    const door = this.doorInFront();
+    if (!door) return false;
+    const props = door.getProperties() as { open?: boolean | string | number };
+    if (!doorIsClosed(props.open)) return false;
+    const key = `${door.position.x},${door.position.y},${door.position.z}`;
+    if (!force && Date.now() - (this.doorOpenedAt.get(key) ?? 0) < 2_500) return false;
+    this.doorOpenedAt.set(key, Date.now());
     try {
-      this.bot.pathfinder.setMovements(new Movements(this.bot));
-      await this.bot.collectBlock.collect(targets, { ignoreNoPath: true });
-      return `我采到了一些${label}。`;
-    } catch (error) {
-      console.warn("采集失败：", error);
-      return `我没采全${label}，我们再试一次吧。`;
-    }
-  }
-
-  private attack(intent: ActionIntent): string {
-    this.stopProtection();
-    const targetName = intent.entity?.toLowerCase();
-    const entity = this.bot.nearestEntity((candidate) => {
-      if (!candidate.name) return false;
-      if (candidate.type === "player" || neverAttack.has(candidate.name)) return false;
-      if (candidate.position.distanceTo(this.bot.entity.position) > 16) return false;
-      if (targetName) return candidate.name === targetName || candidate.name.includes(targetName);
-      return candidate.type === "mob" && this.isHostile(candidate.name);
-    });
-    if (!entity) {
-      this.walkAhead();
-      return intent.entity ? `附近没有${intent.label ?? intent.entity}。` : "附近暂时没有要对付的东西。";
-    }
-    if (entity.name === "creeper") {
-      this.bot.pathfinder.setGoal(new goals.GoalNear(this.bot.entity.position.x - 8, this.bot.entity.position.y, this.bot.entity.position.z - 8, 2));
-      return "那是苦力怕，我们先撤开。";
-    }
-    this.bot.pathfinder.setGoal(new goals.GoalNear(entity.position.x, entity.position.y, entity.position.z, 2));
-    if (entity.position.distanceTo(this.bot.entity.position) < 3.2) this.bot.attack(entity);
-    return `我去对付${intent.label ?? entity.name}。`;
-  }
-
-  private protect(playerName: string): string {
-    this.stopProtection();
-    const defend = (): void => {
-      const player = this.bot.players[playerName];
-      const hostile = this.nearestHostile();
-      if (!hostile) {
-        if (player?.entity) this.bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, 2), true);
-        return;
-      }
-      if (hostile.name === "creeper" || this.bot.health <= 6) {
-        this.bot.pathfinder.setGoal(new goals.GoalNear(this.bot.entity.position.x - 8, this.bot.entity.position.y, this.bot.entity.position.z - 8, 2));
-        return;
-      }
-      if (hostile.position.distanceTo(this.bot.entity.position) < 3.2) this.bot.attack(hostile);
-      else this.bot.pathfinder.setGoal(new goals.GoalNear(hostile.position.x, hostile.position.y, hostile.position.z, 2));
-    };
-    defend();
-    this.protectionTimer = setInterval(defend, 900);
-    return "我会留意附近的怪物，危险时先带你撤开。";
-  }
-
-  private async build(intent: ActionIntent): Promise<string> {
-    this.stopProtection();
-    const template = (intent.template ?? "") as BuildTemplate;
-    const plan = templateBlocks[template];
-    if (!plan) return this.place(intent);
-    const origin = this.bot.entity.position.floored().offset(2, 0, 0);
-    const missing = plan.find((entry) => !entry.names.some((name) => this.bot.inventory.items().some((item) => item.name === name)));
-    if (missing) return `我背包里的材料不够。我们先一起准备${template === "farm" ? "栅栏" : template === "camp" ? "营火和原木" : "木板和原木"}。`;
-    let placed = 0;
-    for (const entry of plan) {
-      if (await this.placeAt(origin.offset(entry.dx, entry.dy, entry.dz), entry.names)) placed += 1;
-    }
-    return placed ? `我先放好了 ${placed} 个方块，我们一起把${templateLabel(template)}完成吧。` : "这里不适合直接建造；请在平坦空地旁边再叫我一次。";
-  }
-
-  private async place(intent: ActionIntent): Promise<string> {
-    this.stopProtection();
-    const names = this.resolveItems(intent.block ?? intent.item);
-    const origin = this.bot.entity.position.floored().offset(2, 0, 0);
-    if (await this.placeAt(origin, names.length ? names : undefined)) {
-      return `我放下了${intent.label ?? intent.block ?? intent.item ?? "方块"}。`;
-    }
-    return "我手里没有合适的方块，或这里放不下。";
-  }
-
-  private async give(intent: ActionIntent, playerName: string): Promise<string> {
-    this.stopProtection();
-    const player = this.bot.players[playerName];
-    if (!player?.entity) return "我现在看不到你，靠近我一点再试试。";
-    const names = this.resolveItems(intent.item ?? intent.block);
-    const item = this.bot.inventory.items().find((candidate) => !names.length || names.includes(candidate.name) || candidate.name.includes(intent.item ?? ""));
-    if (!item) return `我背包里没有${intent.label ?? intent.item ?? "能送你的东西"}。`;
-    try {
-      await this.bot.lookAt(player.entity.position.offset(0, 1.2, 0));
-      await this.bot.toss(item.type, null, Math.min(intent.count ?? 1, item.count));
-      return `给你${intent.label ?? item.name}。`;
-    } catch (error) {
-      console.warn("丢物品失败：", error);
-      return "我没扔出去，再靠近一点吧。";
-    }
-  }
-
-  private goto(intent: ActionIntent, playerName: string): string {
-    this.stopProtection();
-    if (intent.x !== undefined && intent.y !== undefined && intent.z !== undefined) {
-      this.bot.pathfinder.setGoal(new goals.GoalNear(intent.x, intent.y, intent.z, 2));
-      return `我去 ${intent.x}, ${intent.y}, ${intent.z}。`;
-    }
-    return this.come(playerName);
-  }
-
-  private come(playerName: string): string {
-    const player = this.bot.players[playerName];
-    if (!player?.entity) return "我现在看不到你，靠近我一点再试试。";
-    this.stopProtection();
-    const pos = player.entity.position.floored();
-    this.bot.pathfinder.setGoal(new goals.GoalNear(pos.x, pos.y, pos.z, 2));
-    return "我过来了。";
-  }
-
-  private explore(): string {
-    this.stopProtection();
-    this.walkAhead();
-    return "我们往前走走看。";
-  }
-
-  private async dance(): Promise<string> {
-    this.stopProtection();
-    this.bot.pathfinder.setGoal(null);
-    for (let i = 0; i < 3; i += 1) {
-      this.bot.setControlState("jump", true);
-      await wait(180);
-      this.bot.setControlState("jump", false);
-      await wait(220);
-    }
-    return "看我跳！";
-  }
-
-  private async eat(): Promise<string> {
-    const food = this.bot.inventory.items().find((item) => this.bot.registry.foodsByName[item.name]);
-    if (!food) return "我没有能吃的东西。";
-    try {
-      await this.bot.equip(food, "hand");
-      await this.bot.consume();
-      return "我吃了一点东西。";
-    } catch (error) {
-      console.warn("进食失败：", error);
-      return "我现在吃不了。";
-    }
-  }
-
-  private async look(playerName: string): Promise<string> {
-    const player = this.bot.players[playerName];
-    if (!player?.entity) return "我现在看不到你。";
-    await this.bot.lookAt(player.entity.position.offset(0, 1.6, 0));
-    return "我看着你呢。";
-  }
-
-  private status(state: WorldState): string {
-    return `我有 ${state.health}/20 生命、${state.food}/20 饥饿值。附近${state.hostiles.length ? `有${state.hostiles[0].name}` : "很安全"}。`;
-  }
-
-  private fallback(intent: ActionIntent, playerName: string): string {
-    if (intent.block || intent.item) return this.find(intent);
-    if (intent.entity) return this.attack(intent);
-    if (intent.x !== undefined) return this.goto(intent, playerName);
-    return this.explore();
-  }
-
-  private async placeAt(target: Vec3, names?: string[]): Promise<boolean> {
-    const existing = this.bot.blockAt(target);
-    if (!existing || existing.name !== "air") return false;
-    const material = this.bot.inventory.items().find((item) => !names?.length || names.includes(item.name));
-    const reference = this.bot.blockAt(target.offset(0, -1, 0));
-    if (!material || !reference || reference.name === "air") return false;
-    try {
-      await this.bot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, 2));
-      await this.bot.equip(material, "hand");
-      await this.bot.placeBlock(reference, new Vec3(0, 1, 0));
+      await this.bot.lookAt(door.position.offset(0.5, 0.5, 0.5), true);
+      await this.bot.activateBlock(door);
+      console.log(`打开 ${door.name} ${key}`);
       return true;
     } catch (error) {
-      console.warn("放置方块失败：", error);
+      console.warn(`开门失败：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
   }
 
-  private walkAhead(): void {
+  private doorInFront(): Block | null {
+    const pos = this.bot.entity.position;
     const yaw = this.bot.entity.yaw;
-    const ahead = this.bot.entity.position.offset(-Math.sin(yaw) * 18, 0, -Math.cos(yaw) * 18).floored();
-    this.bot.pathfinder.setGoal(new goals.GoalNear(ahead.x, ahead.y, ahead.z, 2));
+    let dx = -Math.sin(yaw);
+    let dz = -Math.cos(yaw);
+    const goal = this.bot.pathfinder?.goal as { x?: number; z?: number; entity?: { position: { x: number; z: number } } } | null;
+    if (goal?.entity) {
+      dx = goal.entity.position.x - pos.x;
+      dz = goal.entity.position.z - pos.z;
+    } else if (typeof goal?.x === "number" && typeof goal.z === "number") {
+      dx = goal.x - pos.x;
+      dz = goal.z - pos.z;
+    }
+    const stepX = Math.abs(dx) >= Math.abs(dz) ? Math.sign(dx) : 0;
+    const stepZ = Math.abs(dz) > Math.abs(dx) ? Math.sign(dz) : 0;
+    const origin = pos.floored();
+    const spots = [origin.offset(stepX, 0, stepZ), origin.offset(stepX, 1, stepZ)];
+    if (stepX === 0 && stepZ === 0) spots.push(origin, origin.offset(0, 1, 0));
+    for (const spot of spots) {
+      const block = this.bot.blockAt(spot);
+      if (block && isToggleDoor(block.name)) return block;
+    }
+    return null;
   }
 
-  private resolveBlocks(name?: string): string[] {
+  bedNearby(maxDistance = 32): boolean {
+    return Boolean(this.nearestBed(maxDistance));
+  }
+
+  keepFollow(playerName: string, distance = 3): boolean {
+    const player = this.bot.players[playerName];
+    if (!player?.entity) return false;
+    this.bot.setControlState("sneak", false);
+    this.useWalk();
+    this.bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, distance), true);
+    return true;
+  }
+
+  keepSit(playerName: string): void {
+    this.bot.pathfinder.setGoal(null);
+    this.bot.clearControlStates();
+    this.bot.setControlState("sneak", true);
+    const player = this.bot.players[playerName];
+    if (player?.entity) void this.bot.lookAt(player.entity.position.offset(0, 1.2, 0));
+  }
+
+  protectOnce(playerName: string, allowFollow = true): boolean {
+    const player = this.bot.players[playerName];
+    const hostile = this.nearestHostile();
+    if (!hostile) {
+      if (allowFollow && player?.entity) this.keepFollow(playerName, 2);
+      return false;
+    }
+    if (hostile.name === "creeper" || this.bot.health <= 6) {
+      this.fleeFrom(hostile.position);
+      return true;
+    }
+    if (hostile.position.distanceTo(this.bot.entity.position) < 3.2) this.bot.attack(hostile);
+    else {
+      this.useWalk();
+      this.bot.pathfinder.setGoal(new goals.GoalNear(hostile.position.x, hostile.position.y, hostile.position.z, 2));
+    }
+    return true;
+  }
+
+  nearestHostileDistance(): number | undefined {
+    const hostile = this.nearestHostile();
+    return hostile ? hostile.position.distanceTo(this.bot.entity.position) : undefined;
+  }
+
+  threatNear(position: Vec3, radius: number): { name: string; distance: number } | undefined {
+    let closest: { name: string; distance: number } | undefined;
+    for (const entity of Object.values(this.bot.entities)) {
+      if (!isHostileEntity(entity)) continue;
+      const distance = entity.position.distanceTo(position);
+      if (distance > radius) continue;
+      if (!closest || distance < closest.distance) closest = { name: entity.name ?? "hostile", distance };
+    }
+    return closest;
+  }
+
+  async helpGather(blockName: string, playerName: string, radius: number, avoid?: Vec3): Promise<StepResult> {
+    const player = this.bot.players[playerName]?.entity;
+    if (!player) return { status: "blocked", message: "我现在看不到你。" };
+    const names = this.resolveBlocks(blockName);
+    const ids = names.map((name) => this.bot.registry.blocksByName[name]?.id).filter((id): id is number => id !== undefined);
+    if (!ids.length || !this.bot.collectBlock) return { status: "done" };
+    const positions = this.bot.findBlocks({ matching: ids, maxDistance: radius + 8, count: 12 });
+    const target = positions
+      .map((pos) => this.bot.blockAt(pos))
+      .filter((block): block is NonNullable<typeof block> => Boolean(block))
+      .filter((block) => block.position.distanceTo(player.position) <= radius)
+      .filter((block) => !avoid || block.position.distanceTo(avoid) > 1.2)
+      .filter((block) => !this.skipped(block.position))
+      .sort((a, b) => a.position.distanceTo(player.position) - b.position.distanceTo(player.position))[0];
+    if (!target) return { status: "done" };
+    const missing = await this.equipForMining(target);
+    if (missing) return { status: "blocked", message: `我没有合适的${missing}，挖不了这块。` };
+    if (this.approachBlock(target)) return { status: "progress" };
+    const mined = await this.mineBlock(target);
+    return mined ? { status: "progress" } : { status: "done" };
+  }
+
+  async lightNear(playerName: string): Promise<StepResult> {
+    const player = this.bot.players[playerName]?.entity;
+    if (!player) return { status: "blocked" };
+    if (player.position.distanceTo(this.bot.entity.position) > 5) return this.come(playerName);
+    const already = this.bot.findBlock({ matching: (block) => block.name === "torch" || block.name === "soul_torch", maxDistance: 6 });
+    if (already && already.position.distanceTo(player.position) < 6) return { status: "done" };
+    return this.place({ type: "place", item: "torch", label: "火把" });
+  }
+
+  countItems(names: string[]): number {
+    if (!names.length) return 0;
+    return this.bot.inventory.items().filter((item) => names.includes(item.name)).reduce((sum, item) => sum + item.count, 0);
+  }
+
+  resolveBlocks(name?: string): string[] {
     if (!name) return [];
     const raw = name.replace(/^minecraft:/, "").toLowerCase();
     if (resourceBlocks[raw]) return resourceBlocks[raw];
@@ -306,29 +387,672 @@ export class SkillController {
     return Object.keys(this.bot.registry.blocksByName).filter((block) => block.includes(raw)).slice(0, 8);
   }
 
-  private resolveItems(name?: string): string[] {
+  resolveItems(name?: string): string[] {
     if (!name) return [];
     const raw = name.replace(/^minecraft:/, "").toLowerCase();
     if (this.bot.registry.itemsByName[raw]) return [raw];
     return Object.keys(this.bot.registry.itemsByName).filter((item) => item.includes(raw)).slice(0, 8);
   }
 
-  private isHostile(name: string): boolean {
-    return ["zombie", "skeleton", "spider", "witch", "drowned", "husk", "creeper"].includes(name);
+  async progress(intent: ActionIntent, playerName: string, state: WorldState): Promise<StepResult> {
+    const type = intent.type.toLowerCase();
+    if (type === "clarify" || type === "status") return { status: "done", message: undefined };
+    if (type === "stop") { this.stop(); return { status: "done", message: "好，我停在这里等你。" }; }
+    if (type === "follow") {
+      const ok = this.keepFollow(playerName);
+      return { status: ok ? "done" : "blocked", message: ok ? "好，我跟着你。" : "我现在看不到你。" };
+    }
+    if (type === "protect") { this.protectOnce(playerName); return { status: "done", message: "我会一直留意怪物。" }; }
+    if (type === "wait") return { status: "done" };
+    if (type === "come") return this.come(playerName);
+    if (type === "goto") return this.goto(intent, playerName);
+    if (type === "find" || type === "find_resource") return this.find(intent);
+    if (type === "collect" || type === "mine" || type === "harvest") return this.collectOne(intent);
+    if (type === "attack" || type === "hunt") return this.attack(intent, playerName);
+    if (type === "build") return this.buildOne(intent);
+    if (type === "place") return this.place(intent);
+    if (type === "give" || type === "toss") return this.give(intent, playerName);
+    if (type === "explore") return this.explore();
+    if (type === "dance" || type === "jump" || type === "emote") return this.dance();
+    if (type === "eat") return this.eat();
+    if (type === "look") return this.look(playerName);
+    if (type === "sit" || type === "sneak" || type === "rest") return this.sit(playerName);
+    if (type === "sleep") return this.sleepNight();
+    if (type === "tp" || type === "teleport") return this.teleportTo(playerName);
+    if (type === "craft") return this.craftOne(intent);
+    if (type === "deposit" || type === "withdraw") return this.moveChest(intent, type);
+    if (intent.block || intent.item) return this.collectOne({ ...intent, type: "collect" });
+    if (intent.entity) return this.attack(intent, playerName);
+    return this.explore();
+  }
+
+  async eatIfHungry(): Promise<boolean> {
+    if (this.bot.food > 14) return false;
+    const result = await this.eat();
+    return result.status === "done";
+  }
+
+  status(state: WorldState): string {
+    const mission = state.mission ? `正在做「${state.mission.title}」第 ${state.mission.step}/${state.mission.total} 步。` : "现在没有长任务。";
+    return `我有 ${state.health}/20 生命、${state.food}/20 饥饿值。${mission}附近${state.hostiles.length ? `有${state.hostiles[0].name}` : "很安全"}。`;
+  }
+
+  private come(playerName: string): StepResult {
+    const player = this.bot.players[playerName];
+    if (!player?.entity) return { status: "blocked", message: "我现在看不到你，靠近我一点再试试。" };
+    const pos = player.entity.position;
+    if (pos.distanceTo(this.bot.entity.position) <= 3.5) return { status: "done", message: "我到你身边了。" };
+    this.useWalk();
+    this.bot.pathfinder.setGoal(new goals.GoalNear(pos.x, pos.y, pos.z, 2));
+    return { status: "progress" };
+  }
+
+  private goto(intent: ActionIntent, playerName: string): StepResult {
+    if (intent.x === undefined || intent.y === undefined || intent.z === undefined) return this.come(playerName);
+    const target = new Vec3(intent.x, intent.y, intent.z);
+    if (target.distanceTo(this.bot.entity.position) <= 3) return { status: "done", message: `我到 ${intent.label ?? "那里"} 了。` };
+    this.useWalk();
+    this.bot.pathfinder.setGoal(new goals.GoalNear(intent.x, intent.y, intent.z, 2));
+    return { status: "progress" };
+  }
+
+  private find(intent: ActionIntent): StepResult {
+    const names = this.resolveBlocks(intent.block);
+    const ids = names.map((name) => this.bot.registry.blocksByName[name]?.id).filter((id): id is number => id !== undefined);
+    const label = intent.label ?? intent.block ?? "那个";
+    const block = ids.length ? this.bot.findBlock({ matching: ids, maxDistance: 64 }) : null;
+    if (!block) {
+      this.walkAhead();
+      return { status: "progress", message: `附近还没有${label}，我先往前找。` };
+    }
+    if (block.position.distanceTo(this.bot.entity.position) <= 3.5) return { status: "done", message: `我找到${label}了。` };
+    this.useWalk();
+    this.bot.pathfinder.setGoal(new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2));
+    return { status: "progress" };
+  }
+
+  private async collectOne(intent: ActionIntent): Promise<StepResult> {
+    const names = this.resolveBlocks(intent.block ?? intent.item);
+    const ids = names.map((name) => this.bot.registry.blocksByName[name]?.id).filter((id): id is number => id !== undefined);
+    const label = intent.label ?? intent.block ?? "这个";
+    if (!ids.length) return { status: "blocked", message: `我不知道${label}长什么样。` };
+    if (!this.bot.collectBlock) return this.find(intent);
+    const target = this.nearestBlock(ids, 32);
+    if (!target) {
+      this.walkAhead();
+      return { status: "progress", message: `附近没有${label}，我再找找。` };
+    }
+    const missing = await this.equipForMining(target);
+    if (missing) return { status: "blocked", message: `我没有合适的${missing}，挖不了${label}。` };
+    if (this.approachBlock(target)) return { status: "progress" };
+    const mined = await this.mineBlock(target);
+    if (mined) return { status: "progress" };
+    return { status: "progress", message: `这块${label}不好采，我换一个。` };
+  }
+
+  private async attack(intent: ActionIntent, playerName: string): Promise<StepResult> {
+    await this.equipWeapon();
+    const targetName = intent.entity?.toLowerCase();
+    if (targetName === "player" || targetName === "child") {
+      const child = this.bot.players[playerName]?.entity;
+      if (!child || child === this.bot.entity) return { status: "progress", message: "我现在看不到你，靠近一点再对战。" };
+      return this.strike(child);
+    }
+    if (targetName === "villager") {
+      const villager = this.bot.nearestEntity((candidate) => candidate.name === "villager" && candidate.position.distanceTo(this.bot.entity.position) <= 32);
+      if (!villager) return { status: "done", message: "附近没有村民。" };
+      return this.strike(villager);
+    }
+    const entity = this.bot.nearestEntity((candidate) => {
+      if (!candidate.name) return false;
+      if (candidate.type === "player" || neverAttack.has(candidate.name)) return false;
+      if (candidate.position.distanceTo(this.bot.entity.position) > 24) return false;
+      if (targetName) return candidate.name === targetName || candidate.name.includes(targetName);
+      return isHostileEntity(candidate);
+    });
+    if (!entity) return { status: "done", message: intent.entity ? `附近没有${intent.label ?? intent.entity}了。` : "附近暂时没有要打的。" };
+    return this.strike(entity);
+  }
+
+  private strike(entity: NonNullable<ReturnType<Bot["nearestEntity"]>>): StepResult {
+    if (entity.name === "creeper") {
+      this.fleeFrom(entity.position);
+      return { status: "progress", message: "那是苦力怕，我们先撤开。" };
+    }
+    void this.bot.lookAt(entity.position.offset(0, (entity.height ?? 1.6) * 0.7, 0));
+    if (entity.position.distanceTo(this.bot.entity.position) < 3.2) {
+      this.bot.attack(entity);
+      return { status: "progress" };
+    }
+    this.useWalk();
+    this.bot.pathfinder.setGoal(new goals.GoalNear(entity.position.x, entity.position.y, entity.position.z, 2));
+    return { status: "progress" };
+  }
+
+  private async equipForMining(block: { name: string; canHarvest: (itemType: number | null) => boolean }): Promise<string | undefined> {
+    const items = this.bot.inventory.items();
+    const choice = chooseHarvestTool({
+      blockName: block.name,
+      tools: items.map((item) => item.name),
+      canHarvest: (name) => {
+        const tool = items.find((item) => item.name === name);
+        return tool ? block.canHarvest(tool.type) : false;
+      },
+      handCanHarvest: block.canHarvest(null),
+    });
+    if (choice.missing) return choice.missing;
+    if (!choice.name || this.bot.heldItem?.name === choice.name) return undefined;
+    const tool = items.find((item) => item.name === choice.name);
+    if (!tool) return undefined;
+    try {
+      await this.bot.equip(tool, "hand");
+    } catch (error) {
+      console.warn("切换工具失败：", error);
+    }
+    return undefined;
+  }
+
+  private async equipWeapon(): Promise<void> {
+    const held = this.bot.heldItem?.name ?? "";
+    if (/_sword$|_axe$/.test(held)) return;
+    const weapon = this.bot.inventory.items().find((item) => /_sword$|_axe$/.test(item.name));
+    if (weapon) {
+      try { await this.bot.equip(weapon, "hand"); } catch { /* keep going unarmed */ }
+    }
+  }
+
+  private async buildOne(intent: ActionIntent): Promise<StepResult> {
+    const plan = templateBlocks[intent.template ?? ""];
+    if (!plan) return this.place(intent);
+    let cursor = this.buildCursor;
+    if (!cursor || cursor.plan !== plan) {
+      cursor = { origin: this.buildOrigin(), index: 0, plan, tries: 0, pending: [] };
+      this.buildCursor = cursor;
+    }
+    const label = intent.label ?? "房子";
+    for (let skips = 0; skips <= plan.length; skips += 1) {
+      if (cursor.index >= plan.length) {
+        if (!cursor.pending.length) {
+          this.buildCursor = undefined;
+          return { status: "done", message: `${label}盖好了。` };
+        }
+        cursor.index = cursor.pending.shift() ?? 0;
+        cursor.tries = 0;
+      }
+      const entry = plan[cursor.index];
+      const target = cursor.origin.offset(entry.dx, entry.dy, entry.dz);
+      const existing = this.bot.blockAt(target);
+      if (existing && existing.name !== "air") {
+        cursor.index += 1;
+        cursor.tries = 0;
+        continue;
+      }
+      const hasMaterial = this.bot.inventory.items().some((item) => entry.names.includes(item.name));
+      if (!hasMaterial) {
+        if (!cursor.pending.includes(cursor.index)) cursor.pending.push(cursor.index);
+        cursor.index += 1;
+        cursor.tries = 0;
+        continue;
+      }
+      const placed = await this.placeAt(target, entry.names);
+      if (placed) {
+        cursor.index += 1;
+        cursor.tries = 0;
+        if (cursor.index >= plan.length && !cursor.pending.length) {
+          this.buildCursor = undefined;
+          return { status: "done", message: `${label}盖好了。` };
+        }
+        return { status: "progress" };
+      }
+      cursor.tries += 1;
+      if (cursor.tries >= 3) {
+        if (!cursor.pending.includes(cursor.index)) cursor.pending.push(cursor.index);
+        cursor.index += 1;
+        cursor.tries = 0;
+      }
+      return { status: "progress", message: skips > 0 ? `还缺材料，${label}还没盖完。` : undefined };
+    }
+    return { status: "progress", message: `${label}还没盖完，我接着放。` };
+  }
+
+  private buildOrigin(): Vec3 {
+    const start = this.bot.entity.position.floored().offset(2, 0, 0);
+    for (let dy = 0; dy < 5; dy += 1) {
+      const here = start.offset(0, -dy, 0);
+      const below = this.bot.blockAt(here.offset(0, -1, 0));
+      const block = this.bot.blockAt(here);
+      if (block?.name === "air" && below && below.boundingBox === "block") return here;
+    }
+    return start;
+  }
+
+  private async place(intent: ActionIntent): Promise<StepResult> {
+    const names = this.resolveItems(intent.block ?? intent.item);
+    const origin = this.bot.entity.position.floored().offset(2, 0, 0);
+    if (await this.placeAt(origin, names.length ? names : undefined)) {
+      return { status: "done", message: `我放下了${intent.label ?? intent.block ?? intent.item ?? "方块"}。` };
+    }
+    return { status: "blocked", message: "我手里没有合适的方块，或这里放不下。" };
+  }
+
+  private async give(intent: ActionIntent, playerName: string): Promise<StepResult> {
+    const player = this.bot.players[playerName];
+    if (!player?.entity) return { status: "blocked", message: "我现在看不到你，靠近我一点再试试。" };
+    if (player.entity.position.distanceTo(this.bot.entity.position) > 4) {
+      this.bot.pathfinder.setGoal(new goals.GoalNear(player.entity.position.x, player.entity.position.y, player.entity.position.z, 2));
+      return { status: "progress" };
+    }
+    const names = this.resolveItems(intent.item ?? intent.block);
+    const item = this.bot.inventory.items().find((candidate) => !names.length || names.includes(candidate.name));
+    if (!item) return { status: "blocked", message: `我背包里没有${intent.label ?? intent.item ?? "能送你的东西"}。` };
+    try {
+      await this.bot.lookAt(player.entity.position.offset(0, 1.2, 0));
+      this.ignoreOwnDrops();
+      await this.bot.toss(item.type, null, Math.min(intent.count ?? 1, item.count));
+      return { status: "done", message: `给你${intent.label ?? item.name}。` };
+    } catch (error) {
+      console.warn("丢物品失败：", error);
+      return { status: "blocked", message: "我没扔出去，再靠近一点吧。" };
+    }
+  }
+
+  private explore(): StepResult {
+    this.walkAhead();
+    return { status: "done", message: "我们往前走走看。" };
+  }
+
+  private async dance(): Promise<StepResult> {
+    this.bot.pathfinder.setGoal(null);
+    for (let i = 0; i < 3; i += 1) {
+      this.bot.setControlState("jump", true);
+      await wait(180);
+      this.bot.setControlState("jump", false);
+      await wait(220);
+    }
+    return { status: "done", message: "看我跳！" };
+  }
+
+  private async eat(): Promise<StepResult> {
+    const food = this.bot.inventory.items().find((item) => this.bot.registry.foodsByName[item.name]);
+    if (!food) return { status: "blocked", message: "我没有能吃的东西。" };
+    try {
+      await this.bot.equip(food, "hand");
+      await this.bot.consume();
+      return { status: "done", message: "我吃了一点东西。" };
+    } catch (error) {
+      console.warn("进食失败：", error);
+      return { status: "blocked", message: "我现在吃不了。" };
+    }
+  }
+
+  private async sleepNight(): Promise<StepResult> {
+    const night = this.canSleepNow();
+    if (this.bot.isSleeping) {
+      if (night) return { status: "progress" };
+      try { await this.bot.wake(); } catch { /* already waking */ }
+      return { status: "done", message: "天亮了，我起来了。" };
+    }
+    if (!night) return { status: "done", message: "现在是白天，不用睡觉。" };
+    const bed = this.nearestBed(48);
+    if (!bed) return { status: "blocked", message: "附近没有床，放一张床我才能睡觉。" };
+    if (bed.position.distanceTo(this.bot.entity.position) > 2) {
+      this.useWalk();
+      this.bot.pathfinder.setGoal(new goals.GoalNear(bed.position.x, bed.position.y, bed.position.z, 1));
+      return { status: "progress", message: "我去床上睡觉。" };
+    }
+    this.bot.pathfinder.setGoal(null);
+    try {
+      await this.bot.sleep(bed);
+      return { status: "progress", message: "我躺下了。你也上床，我们就能到天亮。" };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (message.includes("monsters")) return { status: "blocked", message: "床边有怪物，我先睡不了。" };
+      if (message.includes("occupied")) return { status: "blocked", message: "这张床有人了。" };
+      if (message.includes("not night")) return { status: "done", message: "现在是白天，不用睡觉。" };
+      if (message.includes("too far") || message.includes("cant click") || message.includes("half bed")) {
+        this.bot.pathfinder.setGoal(new goals.GoalNear(bed.position.x, bed.position.y, bed.position.z, 1));
+        return { status: "progress", message: "我再靠近床一点。" };
+      }
+      console.warn("睡觉失败：", error);
+      return { status: "blocked", message: "我现在睡不了。" };
+    }
+  }
+
+  private canSleepNow(): boolean {
+    const time = this.bot.time.timeOfDay;
+    const thunder = this.bot.isRaining && this.bot.thunderState > 0;
+    return thunder || (time >= 12541 && time <= 23458);
+  }
+
+  private nearestBed(maxDistance: number) {
+    return this.bot.findBlock({
+      matching: (block) => this.bot.isABed(block),
+      maxDistance,
+    });
+  }
+
+  private async craftOne(intent: ActionIntent): Promise<StepResult> {
+    const item = intent.item ?? intent.block ?? "";
+    if (!isCraftItem(item)) return { status: "blocked", message: "我还不会做这个。可以说木板、木棍、工作台、木镐或箱子。" };
+    const table = this.findCraftingTable();
+    const have = this.inventoryCounts();
+    const action = nextCraftAction({
+      item,
+      have,
+      tableNearby: Boolean(table),
+    });
+    if (action.kind === "need-table") return { status: "blocked", message: "附近没有工作台，我没法用。" };
+    if (action.kind === "use-table") return this.useCraftingTable(table);
+    if (action.kind === "missing") return { status: "blocked", message: `还缺${action.label}，我做不了。` };
+    if (intent.count && this.countItems([item]) >= intent.count) return { status: "done", message: `${action.label}够了。` };
+    if (action.needsTable) {
+      if (!table) return { status: "blocked", message: "我找不到工作台。" };
+      if (table.position.distanceTo(this.bot.entity.position) > 3) {
+        this.useWalk();
+        this.bot.pathfinder.setGoal(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+        return { status: "progress", message: "我去工作台那里。" };
+      }
+      this.bot.pathfinder.setGoal(null);
+    }
+    this.bot.pathfinder.setGoal(null);
+    try {
+      await this.performCraft(action.item, action.needsTable ? table ?? undefined : undefined);
+    } catch (error) {
+      console.warn("制作失败：", error);
+      const text = error instanceof Error ? error.message : "";
+      if (text.includes("missing ingredient") || text.includes("no recipe")) return { status: "blocked", message: "材料不够，我做不了。" };
+      return { status: "blocked", message: "我在工作台上没做成。" };
+    }
+    const finished = (!intent.count && action.item === item) || Boolean(intent.count && this.countItems([item]) >= intent.count);
+    return {
+      status: finished ? "done" : "progress",
+      message: action.needsTable ? `我在工作台上做了${action.label}。` : `我做了${action.label}。`,
+    };
+  }
+
+  private async performCraft(itemName: string, table?: Block): Promise<void> {
+    const item = this.bot.registry.itemsByName[itemName];
+    if (!item) throw new Error("no recipe");
+    let recipes = this.bot.recipesFor(item.id, null, 1, table ?? null);
+    if (!recipes.length) {
+      recipes = this.bot.recipesAll(item.id, null, table ?? false).filter((recipe) => this.recipeFits(recipe));
+    }
+    const recipe = recipes.find((candidate) => !candidate.requiresTable || table);
+    if (!recipe || (recipe.requiresTable && !table)) throw new Error("no recipe");
+    await this.bot.craft(recipe, 1, recipe.requiresTable ? table : undefined);
+  }
+
+  itemCounts(): Record<string, number> {
+    return this.inventoryCounts();
+  }
+
+  private recipeFits(recipe: { delta: Array<{ id: number; metadata: number | null; count: number }> }): boolean {
+    return recipe.delta.every((delta) => delta.count >= 0 || this.bot.inventory.count(delta.id, delta.metadata) + delta.count >= 0);
+  }
+
+  private findCraftingTable(): Block | null {
+    return this.bot.findBlock({
+      matching: (block) => block.name === "crafting_table",
+      maxDistance: 32,
+    });
+  }
+
+  private async useCraftingTable(table: Block | null): Promise<StepResult> {
+    if (!table) return { status: "blocked", message: "附近没有工作台，我没法用。" };
+    if (table.position.distanceTo(this.bot.entity.position) > 3) {
+      this.useWalk();
+      this.bot.pathfinder.setGoal(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+      return { status: "progress", message: "我去工作台那里。" };
+    }
+    this.bot.pathfinder.setGoal(null);
+    try {
+      await this.bot.activateBlock(table);
+    } catch (error) {
+      console.warn("打开工作台失败：", error);
+      return { status: "blocked", message: "我打不开这张工作台。" };
+    }
+    return { status: "done", message: "我打开工作台了。要做木镐、箱子还是木门？" };
+  }
+
+  private async moveChest(intent: ActionIntent, mode: "deposit" | "withdraw"): Promise<StepResult> {
+    const chest = this.findStorage();
+    const label = intent.label ?? (mode === "deposit" ? "背包里的东西" : "箱子里的东西");
+    if (!chest) return { status: "blocked", message: "附近没有箱子。" };
+    if (chest.position.distanceTo(this.bot.entity.position) > 3) {
+      this.useWalk();
+      this.bot.pathfinder.setGoal(new goals.GoalNear(chest.position.x, chest.position.y, chest.position.z, 2));
+      return { status: "progress", message: "我去箱子那里。" };
+    }
+    this.bot.pathfinder.setGoal(null);
+    const names = storageNames(intent.item);
+    let opened: Chest | undefined;
+    try {
+      opened = await this.bot.openChest(chest);
+      const moved = mode === "deposit" ? await this.depositInto(opened, names) : await this.withdrawFrom(opened, names);
+      if (!moved) {
+        return { status: "blocked", message: mode === "deposit" ? "背包里没有这些东西。" : "箱子里没有这些东西。" };
+      }
+      return { status: "done", message: mode === "deposit" ? `我把${label}放进箱子了。` : `我从箱子里拿出了${label}。` };
+    } catch (error) {
+      console.warn("使用箱子失败：", error);
+      const text = error instanceof Error ? error.message : "";
+      if (text.includes("destination full")) return { status: "blocked", message: "箱子满了，放不下。" };
+      if (text.includes("inventory is full")) return { status: "blocked", message: "我背包满了，拿不了。" };
+      return { status: "blocked", message: "我打不开这只箱子。" };
+    } finally {
+      await opened?.close().catch(() => undefined);
+    }
+  }
+
+  private async depositInto(chest: Chest, names?: string[]): Promise<boolean> {
+    const stacks = this.bot.inventory.items().filter((item) => !names || names.includes(item.name));
+    if (!stacks.length) return false;
+    for (const stack of stacks) await chest.deposit(stack.type, null, stack.count);
+    return true;
+  }
+
+  private async withdrawFrom(chest: Chest, names?: string[]): Promise<boolean> {
+    const stacks = chest.containerItems().filter((item) => !names || names.includes(item.name));
+    if (!stacks.length) return false;
+    for (const stack of stacks) await chest.withdraw(stack.type, null, stack.count);
+    return true;
+  }
+
+  private findStorage(): Block | null {
+    return this.bot.findBlock({
+      matching: (block) => block.name === "chest" || block.name === "trapped_chest" || block.name === "barrel",
+      maxDistance: 32,
+    });
+  }
+
+  private inventoryCounts(): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const item of this.bot.inventory.items()) counts[item.name] = (counts[item.name] ?? 0) + item.count;
+    return counts;
+  }
+
+  private teleportTo(playerName: string): StepResult {
+    const target = this.teleportTarget(playerName);
+    if (!target) return { status: "blocked", message: "这个名字不能写进传送命令。" };
+    this.stop();
+    const command = `/tp ${target}`;
+    console.log(`发送传送命令 ${command}`);
+    this.bot.chat(command);
+    return { status: "done", message: `我传送过去了。要是没到身边，请先开作弊，再输入 /op ${this.bot.username}。` };
+  }
+
+  changeGameMode(mode: string, playerName: string, targetChild: boolean): StepResult {
+    const vanilla = mode === "creative" || mode === "adventure" || mode === "spectator" || mode === "survival" ? mode : "";
+    if (!vanilla) return { status: "blocked", message: "可以说生存、创造、冒险或旁观。" };
+    const labels: Record<string, string> = { survival: "生存", creative: "创造", adventure: "冒险", spectator: "旁观" };
+    const label = labels[vanilla];
+    const who = targetChild ? this.teleportTarget(playerName) : undefined;
+    if (targetChild && !who) return { status: "blocked", message: "这个名字不能写进模式命令。" };
+    const command = who ? `/gamemode ${vanilla} ${who}` : `/gamemode ${vanilla}`;
+    console.log(`发送模式命令 ${command}`);
+    this.bot.chat(command);
+    const message = who
+      ? `我把你改成${label}模式了。要是没变，请先开作弊，再输入 /op ${this.bot.username}。`
+      : `我切换到${label}模式了。要是没变，请先开作弊，再输入 /op ${this.bot.username}。`;
+    return { status: "done", message };
+  }
+
+  private teleportTarget(playerName: string): string | undefined {
+    const named = playerName.trim();
+    if (!named) return undefined;
+    const online = Object.keys(this.bot.players).find((name) => name.toLowerCase() === named.toLowerCase());
+    const target = online ?? named;
+    return /^[\p{L}\p{N}_]{1,16}$/u.test(target) ? target : undefined;
+  }
+
+  private sit(playerName: string): StepResult {
+    const player = this.bot.players[playerName];
+    if (player?.entity && player.entity.position.distanceTo(this.bot.entity.position) > 3.5) return this.come(playerName);
+    const stair = this.nearbySeat();
+    if (stair && stair.position.distanceTo(this.bot.entity.position) > 1.6) {
+      this.bot.setControlState("sneak", false);
+      this.useWalk();
+      this.bot.pathfinder.setGoal(new goals.GoalNear(stair.position.x, stair.position.y, stair.position.z, 1));
+      return { status: "progress", message: "我去那边坐一下。" };
+    }
+    this.keepSit(playerName);
+    return { status: "done", message: "我坐下了。" };
+  }
+
+  private nearbySeat() {
+    return this.bot.findBlock({
+      matching: (block) => /stairs|chair|bench/.test(block.name) && !block.name.includes("wall"),
+      maxDistance: 8,
+    });
+  }
+
+  private async look(playerName: string): Promise<StepResult> {
+    const player = this.bot.players[playerName];
+    if (!player?.entity) return { status: "blocked", message: "我现在看不到你。" };
+    await this.bot.lookAt(player.entity.position.offset(0, 1.6, 0));
+    return { status: "done", message: "我看着你呢。" };
+  }
+
+  private async placeAt(target: Vec3, names?: string[]): Promise<boolean> {
+    const existing = this.bot.blockAt(target);
+    if (!existing || existing.name !== "air") return false;
+    const material = this.bot.inventory.items().find((item) => !names?.length || names.includes(item.name));
+    if (!material) return false;
+    const faces = [
+      { dx: 0, dy: -1, dz: 0, face: new Vec3(0, 1, 0) },
+      { dx: 0, dy: 1, dz: 0, face: new Vec3(0, -1, 0) },
+      { dx: 1, dy: 0, dz: 0, face: new Vec3(-1, 0, 0) },
+      { dx: -1, dy: 0, dz: 0, face: new Vec3(1, 0, 0) },
+      { dx: 0, dy: 0, dz: 1, face: new Vec3(0, 0, -1) },
+      { dx: 0, dy: 0, dz: -1, face: new Vec3(0, 0, 1) },
+    ];
+    const support = faces
+      .map((side) => ({ block: this.bot.blockAt(target.offset(side.dx, side.dy, side.dz)), face: side.face }))
+      .find((side) => side.block && side.block.boundingBox === "block");
+    if (!support?.block) return false;
+    try {
+      if (target.distanceTo(this.bot.entity.position) > 3.5) {
+        this.useWalk();
+        await this.bot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, 2));
+      }
+      await this.bot.equip(material, "hand");
+      await this.bot.placeBlock(support.block, support.face);
+      return true;
+    } catch (error) {
+      console.warn(`放置方块失败：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  private tunePath(): void {
+    const finder = this.bot.pathfinder as unknown as { thinkTimeout: number; searchRadius: number };
+    finder.thinkTimeout = 10_000;
+    finder.searchRadius = 48;
+    if (this.walkMoves) return;
+    const walk = new Movements(this.bot);
+    walk.canDig = false;
+    walk.allow1by1towers = false;
+    walk.canOpenDoors = true;
+    const dig = new Movements(this.bot);
+    dig.canDig = true;
+    dig.allow1by1towers = false;
+    dig.digCost = 8;
+    this.walkMoves = walk;
+    this.digMoves = dig;
+    if (this.bot.collectBlock) this.bot.collectBlock.movements = dig;
+  }
+
+  private useWalk(): void {
+    this.tunePath();
+    if (this.walkMoves) this.bot.pathfinder.setMovements(this.walkMoves);
+  }
+
+  private useDig(): void {
+    this.tunePath();
+    if (this.digMoves) this.bot.pathfinder.setMovements(this.digMoves);
+    if (this.bot.collectBlock && this.digMoves) this.bot.collectBlock.movements = this.digMoves;
+  }
+
+  private blockKey(position: Vec3): string {
+    return `${position.x},${position.y},${position.z}`;
+  }
+
+  private skipBlock(position: Vec3): void {
+    this.skippedBlocks.set(this.blockKey(position), Date.now() + 20_000);
+  }
+
+  private skipped(position: Vec3): boolean {
+    const until = this.skippedBlocks.get(this.blockKey(position));
+    if (until === undefined) return false;
+    if (until < Date.now()) {
+      this.skippedBlocks.delete(this.blockKey(position));
+      return false;
+    }
+    return true;
+  }
+
+  private nearestBlock(ids: number[], maxDistance: number): Block | undefined {
+    const here = this.bot.entity.position;
+    const blocks = this.bot.findBlocks({ matching: ids, maxDistance, count: 16 })
+      .map((pos) => this.bot.blockAt(pos))
+      .filter((block): block is Block => block !== null && !this.skipped(block.position));
+    blocks.sort((a, b) => a.position.distanceTo(here) - b.position.distanceTo(here));
+    return blocks[0];
+  }
+
+  private approachBlock(block: Block): boolean {
+    if (block.position.distanceTo(this.bot.entity.position) <= 3.2) return false;
+    this.useWalk();
+    this.bot.pathfinder.setGoal(new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2));
+    return true;
+  }
+
+  private async mineBlock(block: Block): Promise<boolean> {
+    if (!this.bot.collectBlock) return false;
+    this.useDig();
+    this.bot.pathfinder.setGoal(null);
+    try {
+      await this.bot.collectBlock.collect(block, { ignoreNoPath: true });
+      return true;
+    } catch (error) {
+      this.skipBlock(block.position);
+      this.bot.pathfinder.stop();
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`采集失败：${detail}`);
+      return false;
+    }
+  }
+
+  private walkAhead(): void {
+    const yaw = this.bot.entity.yaw;
+    const ahead = this.bot.entity.position.offset(-Math.sin(yaw) * 12, 0, -Math.cos(yaw) * 12).floored();
+    this.useWalk();
+    this.bot.pathfinder.setGoal(new goals.GoalNear(ahead.x, ahead.y, ahead.z, 2));
   }
 
   private nearestHostile() {
-    return this.bot.nearestEntity((entity) => entity.type === "mob" && Boolean(entity.name) && this.isHostile(entity.name!) && entity.position.distanceTo(this.bot.entity.position) < 14);
+    return this.bot.nearestEntity((entity) => isHostileEntity(entity) && entity.position.distanceTo(this.bot.entity.position) < 14);
   }
-
-  private stopProtection(): void {
-    if (this.protectionTimer) clearInterval(this.protectionTimer);
-    this.protectionTimer = undefined;
-  }
-}
-
-function templateLabel(template: string): string {
-  return ({ cabin: "小木屋", farm: "围栏农场", camp: "篝火营地" })[template] ?? template;
 }
 
 function wait(ms: number): Promise<void> {

@@ -1,10 +1,56 @@
+import type { Offer, RecentAction } from "./actions.js";
+import { preferOffer } from "./actions.js";
 import { config } from "./config.js";
-import { DEFAULT_CRITERIA, type Task, type WorldState } from "./types.js";
+import type { Plan, WorldState } from "./types.js";
 
-/** Jev is the final action gate: it only picks among the planner's candidate ids. */
-export async function chooseAction(task: Task, state: WorldState): Promise<string> {
-  if (!config.jev.apiKey) return safeRule(task, state);
-  const criteria = usableCriteria(task.criteria, state);
+const HIGH_STAKES = new Set(["retreat", "protect", "stop"]);
+
+export function selectJudgedOffer(offers: Offer[], choice: string | undefined, confidence: number, minConfidence: number): Offer {
+  const unique = uniqueOffers(offers);
+  const offer = unique.find((item) => item.key === choice);
+  const task = unique.some((item) => item.key.startsWith("mission:"));
+  if (offer?.key === "follow" && task) return preferOffer(unique.filter((item) => item.key !== "follow"));
+  if (!offer || (HIGH_STAKES.has(offer.key) && confidence < minConfidence)) return preferOffer(unique);
+  return offer;
+}
+
+export async function chooseOffer(offers: Offer[], state: WorldState): Promise<Offer> {
+  const unique = uniqueOffers(offers);
+  if (unique.length === 1 || !config.jev.apiKey) return preferOffer(unique);
+  const criteria = Object.fromEntries(unique.map((offer) => [offer.key, offerCriterion(offer, state.time === "night")]));
+  try {
+    const response = await fetch(config.jev.endpoint, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.jev.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: config.jev.model,
+        state: worldFacts(state),
+        questions: {
+          action: {
+            type: "choice",
+            instructions: "Choose the one legal action that best advances `mission` when a task is active. If `recent` shows that action failed, choose a different legal action. Follow the child when no task needs attention.",
+            criteria,
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(4_000),
+    });
+    if (!response.ok) throw new Error(`Jev ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    const picked = readChoice(await response.json(), "action");
+    const offer = selectJudgedOffer(unique, picked?.choice, picked?.confidence ?? 0, config.jev.minConfidence);
+    const confidence = (picked?.confidence ?? 0).toFixed(2);
+    if (picked?.choice === offer.key) console.log(`Jev 选择 ${offer.key}，置信度 ${confidence}`);
+    else console.log(`Jev 想选 ${picked?.choice ?? "无"}，置信度 ${confidence}，改用 ${offer.key}`);
+    return offer;
+  } catch (error) {
+    console.error("Jev 选择失败，使用本地优先级：", error);
+    return preferOffer(unique);
+  }
+}
+
+/** Ask Jev to execute the planner's current step. The step still runs if Jev is unavailable. */
+export async function judgePlannedStep(offer: Offer, state: WorldState, plan: { title: string; index: number; steps: string[] }): Promise<Offer> {
+  if (!config.jev.apiKey) return offer;
   try {
     const response = await fetch(config.jev.endpoint, {
       method: "POST",
@@ -12,56 +58,146 @@ export async function chooseAction(task: Task, state: WorldState): Promise<strin
       body: JSON.stringify({
         model: config.jev.model,
         state: {
-          task: { skill: task.skill, reply: task.reply, intents: task.intents },
-          world: state,
-          policy: "从候选里选最好玩又安全的陪玩动作。危险或低血量时优先 protect、stop 或 clarify。不要攻击玩家或村民。",
+          ...worldFacts(state),
+          plan: { title: plan.title, current: plan.index + 1, total: plan.steps.length, steps: plan.steps },
         },
         questions: {
-          next_action: {
+          action: {
             type: "choice",
-            instructions: "根据孩子的话和当前世界，只选择一个候选动作。",
-            criteria,
+            instructions: "The planner already ordered `plan.steps`. Execute the current step by choosing its action key. Do not follow the child and do not skip ahead.",
+            criteria: { [offer.key]: offer.description },
           },
         },
       }),
       signal: AbortSignal.timeout(4_000),
     });
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(`Jev ${response.status}: ${detail.slice(0, 500)}`);
+    if (!response.ok) throw new Error(`Jev ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    const picked = readChoice(await response.json(), "action");
+    const confidence = (picked?.confidence ?? 0).toFixed(2);
+    if (picked?.choice === offer.key) console.log(`Jev 执行 ${offer.key}，置信度 ${confidence}`);
+    else console.log(`Jev 想选 ${picked?.choice ?? "无"}，置信度 ${confidence}，仍执行 ${offer.key}`);
+  } catch (error) {
+    console.error("Jev 执行步骤失败，按计划继续：", error);
+  }
+  return offer;
+}
+
+/** Jev only vetoes a proposed task. Danger in the world is handled by code. */
+export async function chooseMission(plan: Plan, state: WorldState): Promise<string> {
+  if (!config.jev.apiKey) return safeRule(plan, state);
+  const proposed = plan.missions[plan.skill] ?? plan.missions.do;
+  try {
+    const response = await fetch(config.jev.endpoint, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.jev.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: config.jev.model,
+        state: {
+          proposed: {
+            skill: plan.skill,
+            title: proposed?.title,
+            mode: proposed?.mode,
+            steps: (proposed?.steps ?? []).slice(0, 8).map((step) => ({
+              type: step.type,
+              block: step.block,
+              entity: step.entity,
+              item: step.item,
+              template: step.template,
+              count: step.count,
+            })),
+          },
+          reply: plan.reply,
+          ...worldFacts(state),
+        },
+        questions: {
+          next_action: {
+            type: "choice",
+            instructions: "Decide whether the companion should start the proposed task now.",
+            criteria: {
+              do: "Start the proposed task. Sparring with the child or attacking a villager is allowed when the child asked. Choose this unless a hostile mob is an immediate threat.",
+              protect: "Do not start the task. A hostile mob is close or health is very low, so protect the child instead.",
+              stop: "Do not start the task when it should clearly not be done. Do not refuse a requested spar with the child or a requested attack on a villager.",
+            },
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(4_000),
+    });
+    if (!response.ok) throw new Error(`Jev ${response.status}: ${(await response.text()).slice(0, 500)}`);
+    const picked = readChoice(await response.json(), "next_action");
+    if ((picked?.choice === "protect" || picked?.choice === "stop") && picked.confidence >= config.jev.minConfidence) {
+      console.log(`Jev 否决任务，改为 ${picked.choice}，置信度 ${picked.confidence.toFixed(2)}`);
+      return picked.choice;
     }
-    const parsed = extractDecision(await response.json(), Object.keys(criteria));
-    if (!parsed.action || parsed.confidence < config.jev.minConfidence) return "clarify";
-    return parsed.action;
+    return plan.skill;
   } catch (error) {
     console.error("Jev 决策失败，使用安全规则：", error);
-    return safeRule(task, state);
+    return safeRule(plan, state);
   }
 }
 
-function usableCriteria(criteria: Task["criteria"], state: WorldState): Record<string, string> {
-  const picked: Record<string, string> = { ...criteria };
-  if (state.health <= 6 && state.hostiles.some((hostile) => hostile.distance < 12)) {
-    picked.protect ??= DEFAULT_CRITERIA.protect;
-    picked.stop ??= DEFAULT_CRITERIA.stop;
-  }
-  return Object.keys(picked).length >= 2 ? picked : { ...DEFAULT_CRITERIA };
-}
-
-function safeRule(task: Task, state: WorldState): string {
-  if (state.health <= 6 && state.hostiles.some((hostile) => hostile.distance < 12)) return "protect";
-  return task.skill;
-}
-
-function extractDecision(value: unknown, allowed: string[]): { action?: string; confidence: number } {
-  if (!value || typeof value !== "object") return { confidence: 0 };
-  const answers = (value as { answers?: Record<string, unknown> }).answers;
-  const next = answers?.next_action;
-  if (!next || typeof next !== "object") return { confidence: 0 };
-  const choice = (next as { choice?: unknown }).choice;
-  const confidence = Number((next as { confidence?: unknown }).confidence);
+function worldFacts(state: WorldState): {
+  health: number;
+  food: number;
+  time: WorldState["time"];
+  childVisible: boolean;
+  childDistance?: number;
+  hostiles: WorldState["hostiles"];
+  mission?: WorldState["mission"];
+  recent: RecentAction[];
+} {
   return {
-    action: typeof choice === "string" && allowed.includes(choice) ? choice : undefined,
-    confidence: Number.isFinite(confidence) ? confidence : 0,
+    health: state.health,
+    food: state.food,
+    time: state.time,
+    childVisible: state.childVisible,
+    childDistance: state.childDistance,
+    hostiles: state.hostiles.slice(0, 3),
+    mission: state.mission,
+    recent: (state.recent ?? []).slice(-5),
   };
+}
+
+function offerCriterion(offer: Offer, night: boolean): string {
+  const key = offer.key;
+  if (key === "retreat") return "Move away from danger. Use this when a creeper is close or health is low. Do not fight.";
+  if (key === "protect") return "Protect the child by fighting only nearby hostile mobs. Never attack players or villagers.";
+  if (key === "sleep") return "Sleep in a nearby bed to skip the night. Do not choose this when monsters are beside the bed.";
+  if (key === "light") return "Place one torch beside the child because it is night.";
+  if (key === "sit") return "Walk to the child and sit beside them.";
+  if (key === "follow") return night ? "It is night. Stay close to the child." : "Follow the child.";
+  if (key === "stop") return "Stop moving and do not follow.";
+  if (key === "wait") return "Wait briefly and do nothing else.";
+  if (key.startsWith("mine:")) return `Help the child mine a nearby ${offer.intent.block ?? "block"}. Do not take the exact block the child is breaking.`;
+  if (key.startsWith("errand:")) return `Collect a little ${offer.intent.block ?? "block"} nearby, then return to the child.`;
+  if (key.startsWith("mission:")) {
+    const step = offer.intent;
+    const detail = [step.type, step.block, step.entity, step.item, step.template, step.count ? `x${step.count}` : undefined].filter(Boolean).join(" ");
+    return `Continue the accepted task. Next step: ${detail}.`;
+  }
+  return `Perform the available action ${key}.`;
+}
+
+function safeRule(plan: Plan, state: WorldState): string {
+  if (state.health <= 6 && state.hostiles.some((hostile) => hostile.distance < 12)) return "protect";
+  return plan.skill;
+}
+
+function readChoice(value: unknown, question: string): { choice: string; confidence: number } | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const answer = (value as { answers?: Record<string, unknown> }).answers?.[question];
+  if (!answer || typeof answer !== "object") return undefined;
+  const choice = (answer as { choice?: unknown }).choice;
+  const confidence = Number((answer as { confidence?: unknown }).confidence);
+  if (typeof choice !== "string") return undefined;
+  return { choice, confidence: Number.isFinite(confidence) ? confidence : 0 };
+}
+
+function uniqueOffers(offers: Offer[]): Offer[] {
+  const seen = new Set<string>();
+  return offers.filter((offer) => {
+    if (seen.has(offer.key)) return false;
+    seen.add(offer.key);
+    return true;
+  });
 }
