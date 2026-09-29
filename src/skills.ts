@@ -9,6 +9,7 @@ import { storageNames } from "./storage.js";
 import { chooseHarvestTool } from "./tools.js";
 import { ChildDrops, DROP_CLAIM_RADIUS, DROP_GIVE_UP_MS } from "./drops.js";
 import { isHostileEntity } from "./mobs.js";
+import { templateBlocks } from "./materials.js";
 import type { ActionIntent, StepResult, WorldState } from "./types.js";
 
 const { goals, Movements } = pathfinderModule;
@@ -20,30 +21,16 @@ const resourceBlocks: Record<string, string[]> = {
   iron: ["iron_ore", "deepslate_iron_ore"],
 };
 
-const templateBlocks: Record<string, Array<{ dx: number; dy: number; dz: number; names: string[] }>> = {
-  cabin: [
-    { dx: 0, dy: 0, dz: 0, names: ["oak_planks", "spruce_planks"] }, { dx: 1, dy: 0, dz: 0, names: ["oak_planks", "spruce_planks"] },
-    { dx: 0, dy: 0, dz: 1, names: ["oak_planks", "spruce_planks"] }, { dx: 1, dy: 0, dz: 1, names: ["oak_planks", "spruce_planks"] },
-    { dx: 0, dy: 1, dz: 0, names: ["oak_log", "spruce_log"] }, { dx: 1, dy: 1, dz: 0, names: ["oak_log", "spruce_log"] },
-    { dx: 0, dy: 1, dz: 1, names: ["oak_log", "spruce_log"] }, { dx: 1, dy: 1, dz: 1, names: ["oak_log", "spruce_log"] },
-  ],
-  farm: [
-    { dx: 0, dy: 0, dz: 0, names: ["oak_fence", "spruce_fence"] }, { dx: 1, dy: 0, dz: 0, names: ["oak_fence", "spruce_fence"] },
-    { dx: 2, dy: 0, dz: 0, names: ["oak_fence", "spruce_fence"] }, { dx: 0, dy: 0, dz: 1, names: ["oak_fence", "spruce_fence"] },
-    { dx: 2, dy: 0, dz: 1, names: ["oak_fence", "spruce_fence"] }, { dx: 0, dy: 0, dz: 2, names: ["oak_fence", "spruce_fence"] },
-    { dx: 1, dy: 0, dz: 2, names: ["oak_fence", "spruce_fence"] }, { dx: 2, dy: 0, dz: 2, names: ["oak_fence", "spruce_fence"] },
-  ],
-  camp: [
-    { dx: 0, dy: 0, dz: 0, names: ["campfire"] }, { dx: -1, dy: 0, dz: 0, names: ["oak_log", "spruce_log"] },
-    { dx: 1, dy: 0, dz: 0, names: ["oak_log", "spruce_log"] }, { dx: 0, dy: 0, dz: -1, names: ["oak_log", "spruce_log"] },
-    { dx: 0, dy: 0, dz: 1, names: ["oak_log", "spruce_log"] },
-  ],
-};
-
 const neverAttack = new Set(["player", "villager", "wandering_trader", "iron_golem", "snow_golem", "cat", "wolf", "allay", "parrot"]);
 
 export class Skills {
-  private buildCursor?: { origin: Vec3; index: number; plan: Array<{ dx: number; dy: number; dz: number; names: string[] }> };
+  private buildCursor?: {
+    origin: Vec3;
+    index: number;
+    tries: number;
+    pending: number[];
+    plan: Array<{ dx: number; dy: number; dz: number; names: string[] }>;
+  };
   private readonly drops = new ChildDrops();
   private readonly skippedBlocks = new Map<string, number>();
   private walkMoves?: InstanceType<typeof Movements>;
@@ -117,8 +104,11 @@ export class Skills {
     if (opened) void this.bot.closeWindow(opened).catch(() => undefined);
     this.bot.pathfinder.setGoal(null);
     this.bot.clearControlStates();
-    this.buildCursor = undefined;
     void this.bot.collectBlock?.cancelTask();
+  }
+
+  clearBuild(): void {
+    this.buildCursor = undefined;
   }
 
   bedNearby(maxDistance = 32): boolean {
@@ -400,26 +390,66 @@ export class Skills {
   private async buildOne(intent: ActionIntent): Promise<StepResult> {
     const plan = templateBlocks[intent.template ?? ""];
     if (!plan) return this.place(intent);
-    if (!this.buildCursor || this.buildCursor.plan !== plan) {
-      this.buildCursor = { origin: this.bot.entity.position.floored().offset(2, 0, 0), index: 0, plan };
+    let cursor = this.buildCursor;
+    if (!cursor || cursor.plan !== plan) {
+      cursor = { origin: this.buildOrigin(), index: 0, plan, tries: 0, pending: [] };
+      this.buildCursor = cursor;
     }
-    while (this.buildCursor.index < plan.length) {
-      const entry = plan[this.buildCursor.index];
-      const target = this.buildCursor.origin.offset(entry.dx, entry.dy, entry.dz);
+    const label = intent.label ?? "房子";
+    for (let skips = 0; skips <= plan.length; skips += 1) {
+      if (cursor.index >= plan.length) {
+        if (!cursor.pending.length) {
+          this.buildCursor = undefined;
+          return { status: "done", message: `${label}盖好了。` };
+        }
+        cursor.index = cursor.pending.shift() ?? 0;
+        cursor.tries = 0;
+      }
+      const entry = plan[cursor.index];
+      const target = cursor.origin.offset(entry.dx, entry.dy, entry.dz);
       const existing = this.bot.blockAt(target);
-      this.buildCursor.index += 1;
-      if (existing && existing.name !== "air") continue;
+      if (existing && existing.name !== "air") {
+        cursor.index += 1;
+        cursor.tries = 0;
+        continue;
+      }
+      const hasMaterial = this.bot.inventory.items().some((item) => entry.names.includes(item.name));
+      if (!hasMaterial) {
+        if (!cursor.pending.includes(cursor.index)) cursor.pending.push(cursor.index);
+        cursor.index += 1;
+        cursor.tries = 0;
+        continue;
+      }
       const placed = await this.placeAt(target, entry.names);
       if (placed) {
-        if (this.buildCursor.index >= plan.length) {
+        cursor.index += 1;
+        cursor.tries = 0;
+        if (cursor.index >= plan.length && !cursor.pending.length) {
           this.buildCursor = undefined;
-          return { status: "done", message: `小${intent.label ?? intent.template ?? "建筑"}放好了。` };
+          return { status: "done", message: `${label}盖好了。` };
         }
         return { status: "progress" };
       }
+      cursor.tries += 1;
+      if (cursor.tries >= 3) {
+        if (!cursor.pending.includes(cursor.index)) cursor.pending.push(cursor.index);
+        cursor.index += 1;
+        cursor.tries = 0;
+      }
+      return { status: "progress", message: skips > 0 ? `还缺材料，${label}还没盖完。` : undefined };
     }
-    this.buildCursor = undefined;
-    return { status: "done", message: intent.label ? `我先把${intent.label}能放的放好了。` : "能放的方块我都试过了。" };
+    return { status: "progress", message: `${label}还没盖完，我接着放。` };
+  }
+
+  private buildOrigin(): Vec3 {
+    const start = this.bot.entity.position.floored().offset(2, 0, 0);
+    for (let dy = 0; dy < 5; dy += 1) {
+      const here = start.offset(0, -dy, 0);
+      const below = this.bot.blockAt(here.offset(0, -1, 0));
+      const block = this.bot.blockAt(here);
+      if (block?.name === "air" && below && below.boundingBox === "block") return here;
+    }
+    return start;
   }
 
   private async place(intent: ActionIntent): Promise<StepResult> {
@@ -540,6 +570,7 @@ export class Skills {
     if (action.kind === "need-table") return { status: "blocked", message: "附近没有工作台，我没法用。" };
     if (action.kind === "use-table") return this.useCraftingTable(table);
     if (action.kind === "missing") return { status: "blocked", message: `还缺${action.label}，我做不了。` };
+    if (intent.count && this.countItems([item]) >= intent.count) return { status: "done", message: `${action.label}够了。` };
     if (action.needsTable) {
       if (!table) return { status: "blocked", message: "我找不到工作台。" };
       if (table.position.distanceTo(this.bot.entity.position) > 3) {
@@ -558,7 +589,7 @@ export class Skills {
       if (text.includes("missing ingredient") || text.includes("no recipe")) return { status: "blocked", message: "材料不够，我做不了。" };
       return { status: "blocked", message: "我在工作台上没做成。" };
     }
-    const finished = action.item === item;
+    const finished = (!intent.count && action.item === item) || Boolean(intent.count && this.countItems([item]) >= intent.count);
     return {
       status: finished ? "done" : "progress",
       message: action.needsTable ? `我在工作台上做了${action.label}。` : `我做了${action.label}。`,
@@ -575,6 +606,10 @@ export class Skills {
     const recipe = recipes.find((candidate) => !candidate.requiresTable || table);
     if (!recipe || (recipe.requiresTable && !table)) throw new Error("no recipe");
     await this.bot.craft(recipe, 1, recipe.requiresTable ? table : undefined);
+  }
+
+  itemCounts(): Record<string, number> {
+    return this.inventoryCounts();
   }
 
   private recipeFits(recipe: { delta: Array<{ id: number; metadata: number | null; count: number }> }): boolean {
@@ -728,13 +763,26 @@ export class Skills {
     const existing = this.bot.blockAt(target);
     if (!existing || existing.name !== "air") return false;
     const material = this.bot.inventory.items().find((item) => !names?.length || names.includes(item.name));
-    const reference = this.bot.blockAt(target.offset(0, -1, 0));
-    if (!material || !reference || reference.name === "air") return false;
+    if (!material) return false;
+    const faces = [
+      { dx: 0, dy: -1, dz: 0, face: new Vec3(0, 1, 0) },
+      { dx: 0, dy: 1, dz: 0, face: new Vec3(0, -1, 0) },
+      { dx: 1, dy: 0, dz: 0, face: new Vec3(-1, 0, 0) },
+      { dx: -1, dy: 0, dz: 0, face: new Vec3(1, 0, 0) },
+      { dx: 0, dy: 0, dz: 1, face: new Vec3(0, 0, -1) },
+      { dx: 0, dy: 0, dz: -1, face: new Vec3(0, 0, 1) },
+    ];
+    const support = faces
+      .map((side) => ({ block: this.bot.blockAt(target.offset(side.dx, side.dy, side.dz)), face: side.face }))
+      .find((side) => side.block && side.block.boundingBox === "block");
+    if (!support?.block) return false;
     try {
-      this.useWalk();
-      await this.bot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, 2));
+      if (target.distanceTo(this.bot.entity.position) > 3.5) {
+        this.useWalk();
+        await this.bot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, 2));
+      }
       await this.bot.equip(material, "hand");
-      await this.bot.placeBlock(reference, new Vec3(0, 1, 0));
+      await this.bot.placeBlock(support.block, support.face);
       return true;
     } catch (error) {
       console.warn(`放置方块失败：${error instanceof Error ? error.message : String(error)}`);

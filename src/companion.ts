@@ -2,8 +2,9 @@ import type { Bot } from "mineflayer";
 import { buildOffers, failureCooldown, filterOffers, planTrigger, type Offer, type RecentAction } from "./actions.js";
 import { craftLabel } from "./craft.js";
 import { config } from "./config.js";
-import { chooseMission, chooseOffer } from "./jev.js";
+import { chooseMission, chooseOffer, judgePlannedStep } from "./jev.js";
 import { Partner, type Assist } from "./partner.js";
+import { buildReply, prepareTaskSteps } from "./materials.js";
 import { Skills } from "./skills.js";
 import { planMission } from "./task-planner.js";
 import type { Mission, MissionBlueprint, Plan, StepResult, WorldState } from "./types.js";
@@ -50,6 +51,7 @@ export class Companion {
   private pickupRequested = false;
   private pickupSince = 0;
   private sawDrop = false;
+  private judgedStep = -1;
   private recent: RecentAction[] = [];
   private readonly cooled = new Map<string, number>();
   private timer?: NodeJS.Timeout;
@@ -103,6 +105,7 @@ export class Companion {
     this.workToken += 1;
     this.decisionToken += 1;
     this.skills.stop();
+    this.skills.clearBuild();
     this.mission = undefined;
     this.holding = undefined;
     this.nextDecisionAt = 0;
@@ -114,10 +117,25 @@ export class Companion {
     this.gathering = false;
     this.pickupRequested = false;
     this.sawDrop = false;
+    this.judgedStep = -1;
   }
 
   private onTask(): boolean {
     return Boolean(this.mission && this.mission.mode !== "follow" && this.mission.mode !== "stop");
+  }
+
+  private longTask(): boolean {
+    if (!this.mission || this.mission.mode !== "focused") return false;
+    return this.mission.steps.length > 1 || this.mission.steps.some((step) => step.type.toLowerCase() === "build");
+  }
+
+  private stepOffer(step: Mission["steps"][number]): Offer {
+    return {
+      key: `mission:${step.type}:${step.block ?? step.entity ?? step.template ?? step.item ?? "go"}`,
+      description: `Execute the current planned step「${this.mission?.title ?? "task"}」: ${step.label ?? step.type}. Do not follow the child.`,
+      intent: step,
+      sustain: false,
+    };
   }
 
   private taskSteps(blueprint: MissionBlueprint): MissionBlueprint["steps"] {
@@ -193,7 +211,11 @@ export class Companion {
     this.stayPut = false;
     const blueprint = plan.missions[chosen] ?? fallbackBlueprint(chosen, plan);
     this.mission = this.createMission(chosen, plan.reply, blueprint);
-    const message = plan.reply;
+    if (this.longTask()) {
+      const steps = this.mission.steps.map((step) => step.label ?? step.type).join(" → ");
+      console.log(`长任务「${this.mission.title}」：${steps}`);
+    }
+    const message = buildReply(this.mission.steps, plan.reply);
     this.say(message, true);
     return message;
   }
@@ -285,7 +307,7 @@ export class Companion {
 
   private createMission(id: string, reply: string, blueprint: MissionBlueprint): Mission {
     const now = Date.now();
-    const steps = this.taskSteps(blueprint);
+    const steps = prepareTaskSteps(this.taskSteps(blueprint), this.skills.itemCounts());
     const first = steps[0];
     return {
       id,
@@ -357,13 +379,15 @@ export class Companion {
         }
         const blueprint = plan.missions.do ?? plan.missions[plan.skill];
         if (!blueprint?.steps.length || plan.skill === "clarify" || plan.skill === "stop") return;
-        this.mission.steps = blueprint.steps;
+        const steps = prepareTaskSteps(this.taskSteps(blueprint), this.skills.itemCounts());
+        this.mission.steps = steps;
         this.mission.stepIndex = 0;
         this.mission.mode = blueprint.mode;
         this.mission.title = blueprint.title ?? this.mission.title;
-        this.mission.baseCount = this.stepBaseCount(blueprint.steps[0]);
+        this.mission.baseCount = this.stepBaseCount(steps[0]);
         this.failures = 0;
         this.holding = undefined;
+        this.judgedStep = -1;
         this.nextDecisionAt = 0;
         console.log(`后台更新计划（${reason}）：${this.mission.title}`);
       })
@@ -381,19 +405,25 @@ export class Companion {
     try {
       const step = this.mission?.steps[this.mission.stepIndex];
       if (this.onTask()) {
-        if (!step) {
+        if (!step || !this.mission) {
           this.finish(playerName, "做完了，我回来找你。");
           return;
         }
-        const offer: Offer = {
-          key: `mission:${step.type}:${step.block ?? step.entity ?? step.template ?? "go"}`,
-          description: `继续「${this.mission?.title ?? "任务"}」：${step.label ?? step.type}`,
-          intent: step,
-          sustain: this.mission?.mode === "hunt" || this.mission?.mode === "guard" || this.mission?.mode === "sit" || this.mission?.mode === "sleep",
-        };
-        this.holding = offer;
+        const offer = this.stepOffer(step);
+        if (this.longTask() && this.judgedStep !== this.mission.stepIndex) {
+          const judged = await judgePlannedStep(offer, state, {
+            title: this.mission.title,
+            index: this.mission.stepIndex,
+            steps: this.mission.steps.map((item) => item.label ?? item.type),
+          });
+          if (generation !== this.planGeneration || token !== this.decisionToken) return;
+          this.judgedStep = this.mission.stepIndex;
+          this.holding = judged;
+        } else {
+          this.holding = this.holding?.key === offer.key ? this.holding : offer;
+        }
         if (!offer.sustain) this.nextDecisionAt = 0;
-        await this.runOffer(offer, playerName, state, false);
+        await this.runOffer(this.holding ?? offer, playerName, state, false);
         return;
       }
       this.assist = this.stayPut
@@ -549,7 +579,7 @@ export class Companion {
       return;
     }
     if (!this.mission || !key.startsWith("mission:")) return;
-    if (this.isStuck() && !this.sticky(offer)) {
+    if (this.isStuck() && !this.sticky(offer) && offer.intent.type.toLowerCase() !== "build") {
       this.stuck = 0;
       this.failures += 1;
       this.cooled.set(key, Date.now() + failureCooldown(key));
@@ -658,6 +688,7 @@ export class Companion {
     this.stayPut = false;
     this.say(message, true);
     this.skills.stop();
+    this.skills.clearBuild();
     this.skills.keepFollow(playerName, 3);
   }
 

@@ -48,6 +48,40 @@ export async function chooseOffer(offers: Offer[], state: WorldState): Promise<O
   }
 }
 
+/** Ask Jev to execute the planner's current step. The step still runs if Jev is unavailable. */
+export async function judgePlannedStep(offer: Offer, state: WorldState, plan: { title: string; index: number; steps: string[] }): Promise<Offer> {
+  if (!config.jev.apiKey) return offer;
+  try {
+    const response = await fetch(config.jev.endpoint, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.jev.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: config.jev.model,
+        state: {
+          ...worldFacts(state),
+          plan: { title: plan.title, current: plan.index + 1, total: plan.steps.length, steps: plan.steps },
+        },
+        questions: {
+          action: {
+            type: "choice",
+            instructions: "The planner already ordered `plan.steps`. Execute the current step by choosing its action key. Do not follow the child and do not skip ahead.",
+            criteria: { [offer.key]: offer.description },
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(4_000),
+    });
+    if (!response.ok) throw new Error(`Jev ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    const picked = readChoice(await response.json(), "action");
+    const confidence = (picked?.confidence ?? 0).toFixed(2);
+    if (picked?.choice === offer.key) console.log(`Jev 执行 ${offer.key}，置信度 ${confidence}`);
+    else console.log(`Jev 想选 ${picked?.choice ?? "无"}，置信度 ${confidence}，仍执行 ${offer.key}`);
+  } catch (error) {
+    console.error("Jev 执行步骤失败，按计划继续：", error);
+  }
+  return offer;
+}
+
 /** Jev only vetoes a proposed task. Danger in the world is handled by code. */
 export async function chooseMission(plan: Plan, state: WorldState): Promise<string> {
   if (!config.jev.apiKey) return safeRule(plan, state);

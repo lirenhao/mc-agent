@@ -40,7 +40,7 @@ mode：follow=一直跟着；guard=保护；hunt=一直进攻直到停下；sit=
 孩子要传送到身边时，type=tp，mode=focused。这会让机器人在游戏里发送 /tp，服务器必须允许它使用该命令。
 孩子要存东西或拿东西时，type=deposit 表示放进附近的箱子，type=withdraw 表示从箱子拿出。item 可省略，省略就是全部。不要把「放进箱子」理解成制作箱子。
 孩子要做东西时，type=craft，item 用英文 id（木板 oak_planks，木棍 stick，木镐 wooden_pickaxe，箱子 chest，火把 torch）。只使用附近已经放好的工作台，不要制作或放置工作台。没有工作台就说明做不了。孩子只说用工作台时，item=use_table。
-多件事拆成有序 steps。例如砍树盖房：collect oak_log → come → build，template 只能是 cabin、farm、camp。
+多件事拆成有序 steps。盖房子时先按背包里已有的方块计算，够了就直接 build，不够再 collect 缺口。template 只能是 cabin、farm、camp。
 block/item 用英文 id（木头用 oak_log，石头用 stone，煤用 coal_ore，铁用 iron_ore，花用 dandelion）。
 攻击时 type=attack，mode=hunt。打怪时 entity 用 zombie、skeleton、spider、creeper 等，没点名就省略 entity。孩子要对战时 entity=player。孩子要打村民时 entity=villager。不要攻击其他玩家。
 听不懂时 steps 用 [{"type":"wait"}]，reply 请孩子再说具体一点。`,
@@ -360,7 +360,7 @@ function withDefaultMissions(task: ReturnType<typeof localPlan>): Plan {
   if (task.skill === "build" && task.template === "cabin") {
     missions.build = {
       mode: "focused",
-      title: "备料并盖小木屋",
+      title: "盖小木屋",
       steps: [
         { type: "collect", block: "wood", count: 8, label: "木头" },
         { type: "come" },
@@ -423,7 +423,7 @@ function localPlan(text: string): Omit<Plan, "criteria" | "missions"> {
     };
   }
   if (/(保护|救我)/.test(text)) return { skill: "protect", reply: "我会一直留意怪物，保护你。" };
-  if (/(房子|小木屋)/.test(text)) return { skill: "build", template: "cabin", reply: "好，我去备木头，再回来盖小木屋。" };
+  if (/(房子|小木屋)/.test(text)) return { skill: "build", template: "cabin", reply: "好，我来盖小木屋。" };
   if (/(农场|围栏)/.test(text)) return { skill: "build", template: "farm", reply: "好，我们来围一个小农场。" };
   if (/(篝火|营地)/.test(text)) return { skill: "build", template: "camp", reply: "好，我们布置一个篝火营地。" };
   if (/(木头|树木|砍树)/.test(text)) return { skill: "find_resource", resource: "wood", reply: "好，我去砍一些木头，砍完回来找你。" };
